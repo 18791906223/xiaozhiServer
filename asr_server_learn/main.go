@@ -4,7 +4,10 @@ import (
 	"asr_server_learn/config"
 	"asr_server_learn/internal/bootstrap"
 	"asr_server_learn/internal/logger"
-	"asr_server_learn/internal/pool"
+	// 显式 import pool 以触发 init() 中将内嵌 DLL 写入 exe 目录的逻辑
+	// go run 时 exe 在 go-build 临时目录，init() 会自动把 DLL 写过去
+	_ "asr_server_learn/internal/pool"
+	"fmt"
 	"os"
 )
 
@@ -29,13 +32,12 @@ func main() {
 	logger.Infof("✅ Configuration loaded")
 	config.PrintConfig()
 
-	// 确保 DLL 在 exe 同目录可用（Windows CGO 动态链接需要）
-	if err := pool.EnsureDLLsCopied(); err != nil {
-		logger.Errorf("Failed to ensure DLLs: %v", err)
-		os.Exit(1)
-	}
-
 	// 初始化所有依赖
 	bootstrap.InitApp(&config.GlobalConfig)
-	print("hello")
+	wd, _ := os.Getwd()
+	exe, _ := os.Executable()
+
+	fmt.Println("工作目录:", wd)
+	fmt.Println("可执行文件:", exe)
+	fmt.Println("命令行参数:", os.Args)
 }
