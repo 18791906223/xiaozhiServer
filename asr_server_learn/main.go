@@ -4,10 +4,8 @@ import (
 	"asr_server_learn/config"
 	"asr_server_learn/internal/bootstrap"
 	"asr_server_learn/internal/logger"
-	// 显式 import pool 以触发 init() 中将内嵌 DLL 写入 exe 目录的逻辑
-	// go run 时 exe 在 go-build 临时目录，init() 会自动把 DLL 写过去
+	// 显式导入 pool 包以触发 cgo 编译 ten_vad_cgo.go，确保 ten_vad.dll 被链接到 exe
 	_ "asr_server_learn/internal/pool"
-	"fmt"
 	"os"
 )
 
@@ -34,10 +32,4 @@ func main() {
 
 	// 初始化所有依赖
 	bootstrap.InitApp(&config.GlobalConfig)
-	wd, _ := os.Getwd()
-	exe, _ := os.Executable()
-
-	fmt.Println("工作目录:", wd)
-	fmt.Println("可执行文件:", exe)
-	fmt.Println("命令行参数:", os.Args)
 }

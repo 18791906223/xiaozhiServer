@@ -1,0 +1,7 @@
+models/asr
+models/speaker
+logs
+data
+.vscode
+_build
+*.exe
