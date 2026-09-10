@@ -9,7 +9,7 @@ var knownProviders = map[string]map[string]struct{}{
 		"ten_vad": {}, "webrtc_vad": {}, "silero_vad": {},
 	},
 	"asr": {
-		"funasr": {}, "aliyun_funasr": {}, "doubao": {}, "aliyun_qwen3": {}, "xunfei": {},
+		"funasr": {}, "aliyun_funasr": {}, "doubao": {}, "aliyun_qwen3": {}, "xunfei": {}, "sherpa_onnx": {},
 	},
 	"llm": {
 		"openai": {}, "ollama": {}, "azure": {}, "anthropic": {}, "zhipu": {}, "aliyun": {},
@@ -226,6 +226,9 @@ func inferASRProvider(data map[string]interface{}) string {
 	}
 	if hasAny(data, "host", "port", "chunk_size", "chunk_interval", "max_connections") {
 		return "funasr"
+	}
+	if hasAny(data, "wait_result_timeout") {
+		return "sherpa_onnx"
 	}
 	return ""
 }

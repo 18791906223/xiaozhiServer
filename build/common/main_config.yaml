@@ -124,7 +124,7 @@ vad:
 
 # 自动语音识别（ASR）配置
 asr:
-  provider: "funasr"  # ASR提供商：funasr 或 doubao
+  provider: "funasr"  # ASR提供商：funasr / doubao / aliyun_funasr / aliyun_qwen3 / xunfei / sherpa_onnx
   # FunASR配置
   funasr:
     host: "127.0.0.1"          # FunASR服务器地址
@@ -136,6 +136,14 @@ asr:
     max_connections: 5         # 最大连接数
     timeout: 30                # 超时时间（秒）
     auto_end: true             # 是否自动结束
+  # SherpaOnnx（内嵌 asr_server，sherpa-onnx SenseVoice）配置
+  # 使用该提供者时无需外部 FunASR 服务，直接连接主进程内嵌的 asr_server（端口 9000）
+  sherpa_onnx:
+    host: "127.0.0.1"          # asr_server 服务地址（本机）
+    port: "9000"               # asr_server 端口（内嵌 asr_server 的 HTTP 端口）
+    sample_rate: 16000         # 采样率
+    timeout: 30                # 连接超时时间（秒）
+    wait_result_timeout: 3     # 音频结束后等待最终结果的超时（秒）
   # 豆包ASR配置
   doubao:
     appid: "xxx"                    # 应用ID

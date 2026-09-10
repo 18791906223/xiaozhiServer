@@ -43,8 +43,6 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/rVNCu3HqELle0jiPLLBs70cWOduZpkS1E78=
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
-github.com/difyz9/edge-tts-go v0.0.2 h1:sVnInlNM24M8AAamlTwUcK1rYUKvc4tasVdNpjcKlAk=
-github.com/difyz9/edge-tts-go v0.0.2/go.mod h1:5YfZLle+LgcSbG+uS0ctRuDzCizyooRfFnet5Ahz6ao=
 github.com/difyz9/edge-tts-go v0.0.3 h1:Ot84CBax2UrfQi798UxPIgt6AkO42w01ucuLXxk7cxY=
 github.com/difyz9/edge-tts-go v0.0.3/go.mod h1:ChQStMfGJV3JQLPE84bpik92KdkYizKYfD+SlVKhEUU=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
