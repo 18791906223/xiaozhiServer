@@ -28,5 +28,5 @@ func GetManagerEndpointAuthToken() string {
 	if token := strings.TrimSpace(viper.GetString("manager.endpoint_auth_token")); token != "" {
 		return token
 	}
-	return DefaultManagerEndpointAuthToken
+	return DefaultManagerEndpointAuthToken // xiaozhi_mcp_openclaw_secret_key
 }

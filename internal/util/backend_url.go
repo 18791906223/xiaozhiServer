@@ -13,6 +13,5 @@ func GetBackendURL() string {
 		return backendURL
 	}
 	// 从配置文件获取
-	return viper.GetString("manager.backend_url")
+	return viper.GetString("manager.backend_url") // "http://127.0.0.1:8080"
 }
-

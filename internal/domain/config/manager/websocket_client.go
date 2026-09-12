@@ -24,23 +24,25 @@ import (
 	log "xiaozhi-esp32-server-golang/logger"
 )
 
+// 请求回调函数，暂时不知道作用
 type MessageHandleFunc func(*WebSocketRequest) (string, error)
 
+// websocket客户端
 type WebSocketClient struct {
-	conn           *websocket.Conn
+	conn           *websocket.Conn // 记录websocket 连接， 在connect中进行赋值
 	baseURL        string
 	requestTimeout time.Duration
-	responseChans  map[string]chan *WebSocketResponse
+	responseChans  map[string]chan *WebSocketResponse // 添加通道是，将会使用mu锁， key 为uuid， 接收请求回调的响应数据
 	callbacks      map[string]func(*WebSocketResponse)
 	requestHandler func(*WebSocketRequest) // 处理收到的请求
-	mu             sync.RWMutex
-	writeMu        sync.Mutex // 保护WebSocket写入操作，防止并发写入
-	isConnected    bool
-	connectMu      sync.Mutex
-	messageQueue   chan *WebSocketRequest
-	workers        sync.WaitGroup
+	mu             sync.RWMutex            // 关闭responseChans和callbacks通道
+	writeMu        sync.Mutex              // 保护WebSocket写入操作，防止并发写入
+	isConnected    bool                    // 是否已连接上
+	connectMu      sync.Mutex              // 连接锁对象, 为了控制conn的赋值，同时只有一个可以进行创建和操作
+	messageQueue   chan *WebSocketRequest  // 无缓存的通道， 将发送的消息推送到这个通道，三个go程读取并进行发送， 只有你close掉，三个go程才会停止，workers才不会等待了
+	workers        sync.WaitGroup          // 工作线程 创建了三个go程去处理消息
 
-	messageHandle cmap.ConcurrentMap[string, MessageHandleFunc]
+	messageHandle cmap.ConcurrentMap[string, MessageHandleFunc] // 啊后续消息处理器
 	uuid          string
 
 	// 重连相关字段
@@ -51,6 +53,7 @@ type WebSocketClient struct {
 	isShuttingDown bool           // 是否正在关闭（主动断开，不重连）
 }
 
+// 请求对象， id， 方法， 路径， 请求头， 请求体
 type WebSocketRequest struct {
 	ID      string                 `json:"id"`
 	Method  string                 `json:"method"`
@@ -59,6 +62,7 @@ type WebSocketRequest struct {
 	Body    map[string]interface{} `json:"body,omitempty"`
 }
 
+// 响应对象，记录id， 状态， 响应头， 响应体， 错误信息
 type WebSocketResponse struct {
 	ID      string                 `json:"id"`
 	Status  int                    `json:"status"`
@@ -67,16 +71,17 @@ type WebSocketResponse struct {
 	Error   string                 `json:"error,omitempty"`
 }
 
+// 连接manager时的websocket请求权， 就是存token的
 type managerWSClientClaims struct {
-	Purpose string `json:"purpose"`
-	UUID    string `json:"uuid"`
-	jwt.RegisteredClaims
+	Purpose              string `json:"purpose"` // 目的
+	UUID                 string `json:"uuid"`    // uuid
+	jwt.RegisteredClaims        // 注册的请求权
 }
 
 var (
-	defaultClient           *WebSocketClient
-	clientOnce              sync.Once
-	systemConfigPushHandler func(map[string]interface{})
+	defaultClient           *WebSocketClient             // 获取客户端对象，只是刚开始没有websocket对象
+	clientOnce              sync.Once                    // 只会进行一次调用，就是创建default
+	systemConfigPushHandler func(map[string]interface{}) // 回调函数，当系统配置发送改变，通知的时候，将会被调用进行通知
 )
 
 // SetSystemConfigPushHandler 设置收到 system_config 推送时的回调（主程序用于合并到 viper 等），由 user_config 在 Init 时注入
@@ -84,6 +89,8 @@ func SetSystemConfigPushHandler(fn func(map[string]interface{})) {
 	systemConfigPushHandler = fn
 }
 
+// 获取默认websocket客户端
+// 这里的sync.Once真好用，程序只会执行一次，非常适合单例模式
 func GetDefaultClient() *WebSocketClient {
 	clientOnce.Do(func() {
 		defaultClient = NewWebSocketClient()
@@ -91,23 +98,24 @@ func GetDefaultClient() *WebSocketClient {
 	return defaultClient
 }
 
+// 创建一个websocket客户端
 func NewWebSocketClient() *WebSocketClient {
 	// 优先从环境变量获取，如果环境变量不存在则从配置获取
-	baseURL := util.GetBackendURL()
+	baseURL := util.GetBackendURL() // "http://127.0.0.1:8080", 获取后台地址
 	if baseURL == "" {
-		baseURL = "http://localhost:8080"
+		baseURL = "http://localhost:8080" // 没有就是默认的
 	}
 
 	return &WebSocketClient{
-		baseURL:        baseURL,
-		requestTimeout: 30 * time.Second,
-		responseChans:  make(map[string]chan *WebSocketResponse),
-		callbacks:      make(map[string]func(*WebSocketResponse)),
-		messageQueue:   make(chan *WebSocketRequest, 100),
-		messageHandle:  cmap.New[MessageHandleFunc](),
-		uuid:           uuid.New().String(),
-		retryStopChan:  make(chan struct{}),
-		isRetrying:     false,
+		baseURL:        baseURL,                                   // 基础地址
+		requestTimeout: 30 * time.Second,                          // 请求超时时间
+		responseChans:  make(map[string]chan *WebSocketResponse),  // 一个map集合存到管道，不知道作用
+		callbacks:      make(map[string]func(*WebSocketResponse)), // 一个map集合存储回调函数，不知道作用
+		messageQueue:   make(chan *WebSocketRequest, 100),         // 100个大小的请求通道，不知道作用
+		messageHandle:  cmap.New[MessageHandleFunc](),             // 并发安全 map， key为string， 值为函数回调
+		uuid:           uuid.New().String(),                       // 生成uuid字符串
+		retryStopChan:  make(chan struct{}),                       // 无缓存的通道
+		isRetrying:     false,                                     // 是否重试中
 	}
 }
 
@@ -117,22 +125,25 @@ func NewWebSocketClientWithHandler(requestHandler func(*WebSocketRequest)) *WebS
 	return client
 }
 
+// 客户端创建连接
 func (c *WebSocketClient) Connect(ctx context.Context) error {
+	// 连接加锁
 	c.connectMu.Lock()
+	// 执行完释放锁
 	defer c.connectMu.Unlock()
-
+	// 如果已连接，就退出
 	if c.isConnected {
 		return nil
 	}
 
 	// 将HTTP URL转换为WebSocket URL
-	wsURL := "ws://" + c.baseURL[7:] + "/ws" // 去掉 "http://" 并添加 "/ws"
-	wsToken, err := c.generateWSToken()
+	wsURL := "ws://" + c.baseURL[7:] + "/ws" // 去掉 "http://" 并添加 "/ws"   // ws://0.0.0.0:8000
+	wsToken, err := c.generateWSToken()      // 生成wstoken
 	if err != nil {
 		return fmt.Errorf("生成WebSocket认证token失败: %v", err)
 	}
 
-	// 建立WebSocket连接
+	// 建立WebSocket连接 发起 WebSocket 拨号连接
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
 		"Origin": []string{c.baseURL},
 		"UUID":   []string{c.uuid},
@@ -143,43 +154,49 @@ func (c *WebSocketClient) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("WebSocket连接失败: %v", err)
 	}
-
+	// 将创建的对象进行保存
 	c.conn = conn
+	// 设置连接成功
 	c.isConnected = true
 
-	// 设置ping处理器
+	// 设置ping处理器， 拿到没有心跳检测没有道理啊， 后面有通过go程
 	conn.SetPongHandler(func(appData string) error {
 		log.Debugf("收到pong消息")
 		return nil
 	})
 
-	// 启动消息处理循环
+	// 启动消息处理循环，回头看这个 如果读取报错进行断开重新并退出
 	go c.handleMessages()
 
-	// 启动消息发送工作线程
+	// 启动消息发送工作线程, 3个工作go程，读取通道的请求，进行websocket的发送，中间加了锁，保证不会并发
 	c.startWorkers()
 
-	// 启动心跳检测
+	// 启动心跳检测， 一个go程 每30秒发送一次心跳，如果报错进行断开重新并退出
 	go c.startHeartbeat()
 
 	log.Debugf("WebSocket客户端已连接到: %s", wsURL)
 	return nil
 }
 
+// 生成token，
+// 这个主要生成一个自己uuid表示唯一的自己
+// 使用hs256对自己身份信息加密，使用同一的密码，进行加密生成token
 func (c *WebSocketClient) generateWSToken() (string, error) {
 	claims := managerWSClientClaims{
-		Purpose: "manager-ws-client",
-		UUID:    c.uuid,
+		Purpose: "manager-ws-client", // mangager的客户端ws请求权
+		UUID:    c.uuid,              // 自己的uuid
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
-		},
+		}, // 配置发行时间和15分钟的过期时间，但是我没有看到其他表示的配置，难道不需要吗， 需要的，下面获取了
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	secret := []byte(util.GetManagerEndpointAuthToken())
-	return token.SignedString(secret)
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims) // 通过s256进行加密生成token，太草率了吧，唯一密钥呢，不需要吗， 需要，工具中获取的
+	secret := []byte(util.GetManagerEndpointAuthToken())       // 获取服务器需要的唯一密钥喽xiaozhi_mcp_openclaw_secret_key
+	//eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJQdXJwb3NlIjoibWFuYWdlci13cy1jbGllbnQiLCJVVUlEIjoiLi4uIiwiaWF0IjoxNzI2MDQ4MDAwLCJleHAiOjE3MjYwNDg5MDB9.签名部分
+	return token.SignedString(secret) // 生成签名密钥，服务端验证加密是否一致，不能方向解密签名部分， 内容在中间这段
 }
 
+// 供外部使用
 func (c *WebSocketClient) Disconnect() error {
 	return c.disconnect(false)
 }
@@ -189,15 +206,15 @@ func (c *WebSocketClient) Disconnect() error {
 func (c *WebSocketClient) disconnect(manualDisconnect bool) error {
 	c.connectMu.Lock()
 	defer c.connectMu.Unlock()
-
+	// 如果没有连接就返回，不进行端口了， 只看见了设置true，的没有看见设置false的
 	if !c.isConnected {
 		return nil
 	}
-
+	// 如果主动断开，就设置表示为真
 	if manualDisconnect {
 		c.isShuttingDown = true
 	}
-
+	// 如果连接不为空，就关闭连接并设置为空
 	if c.conn != nil {
 		if err := c.conn.Close(); err != nil {
 			log.Debugf("关闭WebSocket连接时出错: %v", err)
@@ -207,7 +224,7 @@ func (c *WebSocketClient) disconnect(manualDisconnect bool) error {
 
 	c.isConnected = false
 	c.mu.Lock()
-	// 关闭所有响应通道
+	// 关闭所有响应通道，并重新创建
 	for _, ch := range c.responseChans {
 		close(ch)
 	}
@@ -215,22 +232,24 @@ func (c *WebSocketClient) disconnect(manualDisconnect bool) error {
 	c.callbacks = make(map[string]func(*WebSocketResponse))
 	c.mu.Unlock()
 
-	// 停止工作线程
+	// 停止工作线程， 接收websocket请求发送
 	close(c.messageQueue)
-	c.workers.Wait()
-	// 重新创建消息队列
+	c.workers.Wait() // 当前发送的三个go程退出
+	// 重新创建消息队列 重新创建发送通道
 	c.messageQueue = make(chan *WebSocketRequest, 100)
 
 	log.Debugf("WebSocket连接已断开")
 	return nil
 }
 
+// 获取是否已连接
 func (c *WebSocketClient) IsConnected() bool {
 	c.connectMu.Lock()
 	defer c.connectMu.Unlock()
 	return c.isConnected
 }
 
+// 发送请求
 func (c *WebSocketClient) SendRequest(ctx context.Context, method, path string, body map[string]interface{}) (*WebSocketResponse, error) {
 	if !c.IsConnected() {
 		if err := c.Connect(ctx); err != nil {
@@ -257,13 +276,16 @@ func (c *WebSocketClient) SendRequest(ctx context.Context, method, path string, 
 	// 清理响应通道
 	defer func() {
 		c.mu.Lock()
+		// 删除这个请求
 		delete(c.responseChans, requestID)
 		c.mu.Unlock()
+		// 关闭响应通道
 		close(responseChan)
 	}()
 
 	// 发送请求（使用写入锁保护）
 	c.writeMu.Lock()
+	// 发送请求， 直接发送
 	err := c.conn.WriteJSON(request)
 	c.writeMu.Unlock()
 	if err != nil {
@@ -291,6 +313,7 @@ func (c *WebSocketClient) Ping() error {
 	return c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second))
 }
 
+// 获取的状态
 func (c *WebSocketClient) GetStatus(ctx context.Context) (*WebSocketResponse, error) {
 	return c.SendRequest(ctx, "GET", "/api/ws/status", nil)
 }
@@ -306,32 +329,39 @@ func ConnectManagerWebSocket(ctx context.Context) error {
 	return GetDefaultClient().Connect(ctx)
 }
 
+// 关闭连接
 func DisconnectManagerWebSocket() error {
 	client := GetDefaultClient()
 	client.StopReconnect()
 	return client.disconnect(true) // 主动断开，不触发重连
 }
 
+// 发送消息
 func SendManagerRequest(ctx context.Context, method, path string, body map[string]interface{}) (*WebSocketResponse, error) {
 	return GetDefaultClient().SendRequest(ctx, method, path, body)
 }
 
+// 发送ping消息
 func ManagerWebSocketPing(ctx context.Context) error {
 	return GetDefaultClient().Ping()
 }
 
+// 获取状态
 func ManagerWebSocketStatus(ctx context.Context) (*WebSocketResponse, error) {
 	return GetDefaultClient().GetStatus(ctx)
 }
 
+// 发送echo
 func ManagerWebSocketEcho(ctx context.Context, message string) (*WebSocketResponse, error) {
 	return GetDefaultClient().Echo(ctx, message)
 }
 
+// 发送websocket连接
 func IsManagerWebSocketConnected() bool {
 	return GetDefaultClient().IsConnected()
 }
 
+// 发送设备请求
 func SendDeviceRequest(ctx context.Context, path string, body map[string]interface{}) (*WebSocketResponse, error) {
 	return GetDefaultClient().SendRequest(ctx, "POST", path, body)
 }
@@ -346,8 +376,9 @@ func (c *WebSocketClient) startWorkers() {
 			defer c.workers.Done()
 
 			log.Debugf("Manager WebSocket工作线程 %d 已启动", workerID)
-
+			// 一直等待通道有值，有值就处理，没值就阻塞，除非关闭这个通道
 			for request := range c.messageQueue {
+				// 连接断开就跳过当前选好
 				if !c.IsConnected() {
 					log.Debugf("工作线程 %d: WebSocket未连接，丢弃请求", workerID)
 					continue
@@ -355,6 +386,7 @@ func (c *WebSocketClient) startWorkers() {
 
 				// 发送请求（使用写入锁保护）
 				c.writeMu.Lock()
+				// 这步是将请求信息转换为json，通过websocket发送出去
 				err := c.conn.WriteJSON(request)
 				c.writeMu.Unlock()
 				if err != nil {
@@ -374,6 +406,7 @@ func (c *WebSocketClient) startWorkers() {
 
 // handleConnectionError 处理连接错误
 func (c *WebSocketClient) handleConnectionError() {
+	// 如果连接着，断开，然后重新连接
 	if c.IsConnected() {
 		log.Warn("检测到WebSocket连接错误，正在断开连接...")
 		c.disconnect(false) // 错误断开，会触发重连
@@ -389,18 +422,22 @@ func (c *WebSocketClient) startHeartbeat() {
 
 	for {
 		select {
+		// 读取定时器器，到30秒就是通道就会有一个值，然后消费掉，等待下一次
 		case <-ticker.C:
+			// 连接断开了就可以退出了
 			if !c.IsConnected() {
 				return
 			}
 
 			// 发送ping消息
 			c.writeMu.Lock()
+			// 给服务器发送一个ping数据
 			err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second))
 			c.writeMu.Unlock()
 
 			if err != nil {
 				log.Warnf("发送ping失败，连接可能已断开: %v", err)
+				// 关闭重新连接
 				c.disconnect(false) // 错误断开，会触发重连
 				// 触发重连
 				c.triggerReconnect()
@@ -409,6 +446,7 @@ func (c *WebSocketClient) startHeartbeat() {
 			log.Debugf("发送ping消息成功")
 
 		case <-c.retryStopChan:
+			// 收到重连协议停止的信号，退出不发送信号了
 			return
 		}
 	}
@@ -478,7 +516,7 @@ func (c *WebSocketClient) startReconnectLoop() {
 			log.Info("Manager WebSocket连接已恢复，停止重连")
 			return
 		}
-
+		// 累加重连次数
 		retryCount++
 		log.Warnf("Manager WebSocket连接失败 (第%d次)，等待 %v 后重试连接...", retryCount, delay)
 
@@ -520,6 +558,7 @@ func (c *WebSocketClient) StopReconnect() {
 	c.retryMu.Unlock()
 
 	if shouldClose {
+		// 有值的情况
 		// 使用 select 避免重复关闭通道
 		select {
 		case <-c.retryStopChan:
@@ -574,7 +613,7 @@ func (c *WebSocketClient) SendRequestWithCallback(ctx context.Context, method, p
 	}
 }
 
-// SendRequestAsync 异步发送请求
+// SendRequestAsync 异步发送请求， 也不需要返回值
 func (c *WebSocketClient) SendRequestAsync(ctx context.Context, method, path string, body map[string]interface{}) (string, error) {
 	if !c.IsConnected() {
 		if err := c.Connect(ctx); err != nil {
@@ -642,7 +681,9 @@ func (c *WebSocketClient) handleSystemConfigPush(data map[string]interface{}) {
 
 // handleMessages 处理接收到的WebSocket消息
 func (c *WebSocketClient) handleMessages() {
+	// 死循环
 	for {
+		// 如果连接端口，就不会有消息了
 		if !c.isConnected {
 			return
 		}
@@ -650,6 +691,7 @@ func (c *WebSocketClient) handleMessages() {
 		// 读取消息类型
 		messageType, reader, err := c.conn.NextReader()
 		if err != nil {
+			// 如果错误就断开，然后重新连接
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Debugf("WebSocket读取错误: %v", err)
 			}
@@ -664,13 +706,21 @@ func (c *WebSocketClient) handleMessages() {
 		case websocket.TextMessage:
 			// 处理JSON消息
 			var rawMessage map[string]interface{}
+			// 对文本消息进行转换字典对象，如果解析失败就重新等待，
 			if err := json.NewDecoder(reader).Decode(&rawMessage); err != nil {
 				log.Errorf("解析JSON消息失败: %v", err)
 				continue
 			}
 
 			// 根据消息类型判断：服务端推送(system_config)、请求、响应
+			//{
+			//	"type": "system_config",
+			//	"data": {},
+			//	"method": "",
+			//	"status": ""
+			//}
 			if msgType, _ := rawMessage["type"].(string); msgType == "system_config" {
+				// 系统配置发生改变时触发
 				if data, ok := rawMessage["data"].(map[string]interface{}); ok {
 					c.handleSystemConfigPush(data)
 				} else {
@@ -823,33 +873,39 @@ const configTestTotalTimeout = 90 * time.Second
 
 // handleConfigTestRequest 处理配置测试请求：VAD/ASR/LLM/TTS 使用下发的配置与固定 WAV/文本执行轻量测试
 func (c *WebSocketClient) handleConfigTestRequest(request *WebSocketRequest) {
+	// 应该是规定好了，直接从data中获取数据
 	data, _ := request.Body["data"].(map[string]interface{})
 	if data == nil {
 		log.Debugf("[config_test] 请求 ID=%s 缺少 data 字段", request.ID)
 		_ = c.SendResponse(request.ID, 400, nil, "缺少 data 字段")
 		return
 	}
+	// 获取测试文本
 	testText, _ := request.Body["test_text"].(string)
-	// debug: 请求中各类型配置数量（不含 provider）
+	// debug: 请求中各类型配置数量（不含 provider）， 获取模型提供商的数量
 	log.Debugf("[config_test] 请求 ID=%s test_text=%q data 各类型条目数: vad=%d asr=%d llm=%d tts=%d",
 		request.ID, testText,
 		countConfigKeys(data["vad"]), countConfigKeys(data["asr"]),
 		countConfigKeys(data["llm"]), countConfigKeys(data["tts"]))
-
+	// 定义测试结果结构体
 	type configTestResult struct {
 		vad, asr, llm, tts map[string]interface{}
 	}
+	// 定义一个通道
 	done := make(chan configTestResult, 1)
 	go func() {
+		// data相当于配置，testText相当于文本
 		vadR, asrR, llmR, ttsR := RunConfigTest(data, testText)
 		done <- configTestResult{vadR, asrR, llmR, ttsR}
 	}()
 
 	var vadR, asrR, llmR, ttsR map[string]interface{}
+	// 阻塞等待结果
 	select {
 	case res := <-done:
 		vadR, asrR, llmR, ttsR = res.vad, res.asr, res.llm, res.tts
 	case <-time.After(configTestTotalTimeout):
+		// 超时了
 		log.Warnf("[config_test] 请求 ID=%s 整体超时 %v", request.ID, configTestTotalTimeout)
 		body := map[string]interface{}{
 			"vad": map[string]interface{}{"_error": map[string]interface{}{"ok": false, "message": "配置测试总超时"}},
@@ -857,6 +913,7 @@ func (c *WebSocketClient) handleConfigTestRequest(request *WebSocketRequest) {
 			"llm": map[string]interface{}{"_error": map[string]interface{}{"ok": false, "message": "配置测试总超时"}},
 			"tts": map[string]interface{}{"_error": map[string]interface{}{"ok": false, "message": "配置测试总超时"}},
 		}
+		// 发送数据回去
 		_ = c.SendResponse(request.ID, 200, body, "")
 		return
 	}
@@ -879,6 +936,7 @@ func (c *WebSocketClient) handleConfigTestRequest(request *WebSocketRequest) {
 
 // fillEmptyConfigTestResult 当请求包含该类型但测试结果为空时，写入 _none 条目
 func fillEmptyConfigTestResult(data map[string]interface{}, typ string, result map[string]interface{}) {
+	// 获取指定类型如asr， 有数据就返回
 	if _, has := data[typ]; !has || len(result) > 0 {
 		return
 	}
@@ -1218,7 +1276,8 @@ func SendMcpToolListRequestWithCallback(ctx context.Context, agentID string, cal
 func Init(ctx context.Context) error {
 	log.Infof("Initializing Manager config provider with WebSocket client")
 
-	// 创建WebSocket客户端
+	// 创建WebSocket客户端， 只不过这个客户端，里面的websocket还没有进行创建，
+	//后面看声明时候进行创建赋值
 	client := GetDefaultClient()
 
 	// 尝试连接到WebSocket服务器

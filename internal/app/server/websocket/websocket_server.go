@@ -73,7 +73,9 @@ func WithOnInjectMessage(handler func(deviceID, message string, skipLlm bool, au
 
 // NewWebSocketServer 创建新的 WebSocket 服务器（WithOption 方式）
 func NewWebSocketServer(port int, opts ...WebSocketServerOption) *WebSocketServer {
+	// 构建websocket服务对象
 	s := &WebSocketServer{
+		// 设置升级后的配置
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -81,11 +83,13 @@ func NewWebSocketServer(port int, opts ...WebSocketServerOption) *WebSocketServe
 				return true // 允许所有来源的连接
 			},
 		},
-		// 默认值
-		authManager:      auth.A(),
-		port:             port,
+		// 默认值，鉴权对象
+		authManager: auth.A(),
+		port:        port,
+		// mcp服务
 		globalMCPManager: mcp.GetGlobalMCPManager(),
 	}
+	// 构建时候进行赋值
 	for _, opt := range opts {
 		opt(s)
 	}

@@ -107,22 +107,26 @@ func RunConfigTest(data map[string]interface{}, testText string) (vadResult, asr
 	log.Debugf("[config_test] RunConfigTest 开始 test_text=%q data.keys=%v", testText, mapKeys(data))
 	// 打印接收到的各类型 config_id 及脱敏后的配置内容，便于 debug
 	for _, typ := range []string{"vad", "asr", "llm", "tts"} {
+		// 获取配置vad
 		v, _ := data[typ].(map[string]interface{})
 		if v == nil {
 			continue
 		}
+		// 创建一个字符串数组
 		ids := make([]string, 0, len(v))
 		for k := range v {
+			// 加入
 			ids = append(ids, k)
 		}
 		log.Debugf("[config_test] 收到 data[%s] config_ids=%v", typ, ids)
 	}
+	// 对数据进行脱敏
 	if redacted := redactSensitive(data); redacted != nil {
 		if b, err := json.Marshal(redacted); err == nil {
 			log.Debugf("[config_test] 收到 data 脱敏后: %s", string(b))
 		}
 	}
-
+	// 加载wav音频
 	pcm, _ := loadTestWav(DefaultTestWavPath)
 	if pcm == nil || len(pcm) == 0 {
 		log.Debugf("[config_test] WAV 文件加载失败或为空，使用 fallbackPCM")

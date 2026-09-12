@@ -28,26 +28,30 @@ import (
 // App 统一管理所有协议服务和 ChatManager
 
 type App struct {
-	wsServer       *websocket.WebSocketServer
-	mqttUdpAdapter *mqtt_udp.MqttUdpAdapter
-	mqttUdpMu      sync.RWMutex
+	wsServer       *websocket.WebSocketServer // 保存websocket服务
+	mqttUdpAdapter *mqtt_udp.MqttUdpAdapter   //  mqtt适配器
+	mqttUdpMu      sync.RWMutex               // mqtt使用的锁
 
 	// ChatManager管理 - 使用concurrent map
 	chatManagers cmap.ConcurrentMap[string, *chat.ChatManager]
 }
 
 func NewApp() *App {
+	// 错误记录
 	var err error
+	// 创建服务应用对象
 	app := &App{
-		chatManagers: cmap.New[*chat.ChatManager](),
-	}
+		chatManagers: cmap.New[*chat.ChatManager](), // 初始化聊天集合
+	} // 其他的怎么不初始化化呢
+	//注册当前设备传输解析器
 	mcp.RegisterCurrentDeviceTransportResolver(func(deviceID string) string {
-		chatManager, exists := app.GetChatManager(deviceID)
+		chatManager, exists := app.GetChatManager(deviceID) // 获取当前当前设备的对话
 		if !exists || chatManager == nil {
 			return ""
 		}
-		return chatManager.GetTransportType()
+		return chatManager.GetTransportType() // 获取传输的方式
 	})
+	// 创建websocket 服务，和客户端进行通信
 	app.wsServer = app.newWebSocketServer()
 	app.mqttUdpAdapter, err = app.newMqttUdpAdapter()
 	if err != nil {
@@ -174,8 +178,10 @@ func (app *App) newUdpServer() (*mqtt_udp.UdpServer, error) {
 	return udpServer, nil
 }
 
+// 创建websocket进行通信
 func (app *App) newWebSocketServer() *websocket.WebSocketServer {
 	port := viper.GetInt("websocket.port")
+	// 创建websocket服务器
 	return websocket.NewWebSocketServer(
 		port,
 		websocket.WithOnNewConnection(app.OnNewConnection),

@@ -44,7 +44,7 @@ system_prompt: "你是一个叫小智/小志的台湾女孩，说话机车，声
 
 # 日志配置
 log:
-  path: "../logs/"      # 日志文件存储路径
+  path: "../logs/"      # 日志文件存储路径,为什么还要上一级啊不是太理解
   file: "server.log"    # 日志文件名
   level: "debug"        # 日志级别（debug/info/warn/error）
   max_age: 3           # 日志文件最大保存天数

@@ -25,27 +25,35 @@ func main() {
 	asrEnable := flag.Bool("asr-enable", defaultAsrEnable, "是否启用内嵌 asr_server")
 	asrConfig := flag.String("asr-config", "", "asr_server 配置文件路径，启用时可选，默认 asr_server/config.json")
 	flag.Parse()
-
+	// 配置文件路径为空，退出
 	if *configFile == "" {
 		fmt.Println("配置文件路径不能为空")
 		return
 	}
 
 	// 先启动 manager，再 Init，否则 Init 里 updateConfigFromAPI 会一直连不上 manager 导致卡死
+	// 是否启动后端程序
 	if *managerEnable {
+		// 启动后台程序
 		StartManagerHTTP(*managerConfig)
 	}
+	// 启动声纹服务
 	if *asrEnable {
+		// 启动声纹服务
 		StartAsrServerHTTP(*asrConfig)
 	}
+	// 初始化主服务
 	err := Init(*configFile)
 	if err != nil {
 		return
 	}
 
 	// 根据配置启动 pprof 服务
+	// 是否启动服务器的性能检测
 	if viper.GetBool("server.pprof.enable") {
+		// 端口
 		pprofPort := viper.GetInt("server.pprof.port")
+		// 通过go线程启动服务
 		go func() {
 			log.Infof("启动 pprof 服务，端口: %d", pprofPort)
 			if err := http.ListenAndServe(fmt.Sprintf(":%d", pprofPort), nil); err != nil {
@@ -59,7 +67,7 @@ func main() {
 
 	// 创建服务器
 	appInstance := server.NewApp()
-
+	// 创建一个锁
 	var lock sync.RWMutex
 	// 注册 system_config 热更：用 viper 当前配置与推送配置对比，仅当内容变更时合并并触发热更
 	user_config.RegisterManagerSystemConfigHandler(func(data map[string]interface{}) {

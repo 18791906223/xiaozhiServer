@@ -29,6 +29,7 @@ var (
 	configUpdateWg     sync.WaitGroup
 )
 
+// 初始化配置文件拿着config/config.yaml进行
 func Init(configFile string) error {
 	//init config
 	err := initConfig(configFile)
@@ -44,6 +45,7 @@ func Init(configFile string) error {
 	// 初始化配置系统（包括WebSocket连接）
 	// 注意：不要在此处单独注册 ApplySystemConfigToViper，否则会先于 main 的回调执行，导致 main 里读取的「当前配置」已是合并后的新配置；合并应在 main 的回调中、在读取 current 并比较之后再执行。
 	ctx := context.Background()
+	// 看名字是初始化配置系统
 	if err := user_config.InitConfigSystem(ctx); err != nil {
 		fmt.Printf("初始化配置系统失败: %v\n", err)
 	}
@@ -124,10 +126,11 @@ func StopPeriodicConfigUpdate() {
 	}
 }
 
+// 入门第一步，配置文件通过viper来进行读取，这是一个专门读取yaml的对象
 func initConfig(configFile string) error {
 	viper.SetConfigFile(configFile)
 
-	// 读取配置文件
+	// 读取配置文件， 将其保存起来
 	if err := viper.ReadInConfig(); err != nil {
 		return err
 	}
@@ -233,10 +236,13 @@ func updateConfigFromAPI() error {
 	}
 }
 
+// 初始化日志服务， 读取配置文件设置日志对象
 func initLog() error {
 	// 输出到文件
 	binPath, _ := os.Executable()
+	// 找到当前文件的更目录
 	baseDir := filepath.Dir(binPath)
+	// 在输出目录拼接日志输出的路径  target/../logs/server.log
 	logPath := fmt.Sprintf("%s/%s%s", baseDir, viper.GetString("log.path"), viper.GetString("log.file"))
 	/* 日志轮转相关函数
 	`WithLinkName` 为最新的日志建立软连接
@@ -247,28 +253,31 @@ func initLog() error {
 	*/
 	// 下面配置日志每隔 1 分钟轮转一个新文件，保留最近 3 分钟的日志文件，多余的自动清理掉。
 	writer, err := rotatelogs.New(
-		logPath+".%Y%m%d",
-		rotatelogs.WithLinkName(logPath),
-		rotatelogs.WithRotationCount(uint(viper.GetInt("log.max_age"))),
-		rotatelogs.WithRotationTime(time.Duration(86400)*time.Second),
+		logPath+".%Y%m%d",                // 如果写入数据，就写入到这个文件
+		rotatelogs.WithLinkName(logPath), // 创建一个软连接， 将其连接到上面真正写入文件的位置，会动态更
+		rotatelogs.WithRotationCount(uint(viper.GetInt("log.max_age"))), // 只会保存3个文件，超出了就会删除最旧的那一个
+		rotatelogs.WithRotationTime(time.Duration(86400)*time.Second),   // 每次隔24小时，创建一个新文件
 	)
+	// 创建失败就退出
 	if err != nil {
 		fmt.Printf("init log error: %v\n", err)
 		os.Exit(1)
 		return err
 	}
 
-	// 根据配置决定输出目标
+	// 根据配置决定输出目标  true ， 是否输出到控制台
 	if viper.GetBool("log.stdout") {
-		// 同时输出到文件和标准输出
+		// 同时输出到文件和标准输出，这个对象用于转换，收到数据即转发到文件中，有转换到控制台上
 		multiWriter := io.MultiWriter(writer, os.Stdout)
+		// 日志对象设置日志的的输出， 他在进行转发
 		logrus.SetOutput(multiWriter)
+		// 日志设置格式化方式，先添加时间和颜色
 		logrus.SetFormatter(&logrus.TextFormatter{
 			TimestampFormat: "2006-01-02 15:04:05.000", //时间格式化，添加毫秒
 			ForceColors:     true,                      // 标准输出启用颜色
 		})
 	} else {
-		// 只输出到文件
+		// 只输出到文件， 不输出控制台，就可以直接进行配置，不用添加并行的写入对象
 		logrus.SetOutput(writer)
 		logrus.SetFormatter(&logrus.TextFormatter{
 			TimestampFormat: "2006-01-02 15:04:05.000", //时间格式化，添加毫秒
@@ -277,8 +286,12 @@ func initLog() error {
 	}
 
 	// 禁用默认的调用者报告，使用自定义的caller字段
+	// 关闭 logrus 的"调用者信息"记录功能，即日志里不再自动附带"哪个文件、哪一行、哪个函数"打印的这条日志。
+	// 即 time="2026-09-11T10:00:00+08:00" level=info msg="服务启动" func=main.main file="main.go:42"
 	logrus.SetReportCaller(false)
-	logLevel, _ := logrus.ParseLevel(viper.GetString("log.level"))
+	// 获取并转换日志等级
+	logLevel, _ := logrus.ParseLevel(viper.GetString("log.level")) // debug
+	// 设置日志对象的等级
 	logrus.SetLevel(logLevel)
 
 	return nil
