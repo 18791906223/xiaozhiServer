@@ -142,16 +142,30 @@ go mod tidy
 go build -o xiaozhi_server ./cmd/server
 ```
 
-Windows PowerShell 本地编译启用 Silero VAD 时，需要先让 CGO 找到 ONNX Runtime 头文件和 import library：
+Windows PowerShell 本地编译启用 Silero VAD 时，需要 CGO 找到 ONNX Runtime 头文件和 import library。ONNX Runtime 已随仓库附带在 `third_party/onnxruntime/win-x64/`，无需再下载。首次配置（每台机器只需执行一次，写入 go env，对所有 Go 项目生效）：
+
+```powershell
+go env -w CGO_CFLAGS="-Ie:/workspace/go/xiaozhiServer/third_party/onnxruntime/win-x64/include"
+go env -w CGO_LDFLAGS="-Le:/workspace/go/xiaozhiServer/third_party/onnxruntime/win-x64/lib"
+```
+
+之后正常编译即可：
 
 ```powershell
 $env:CGO_ENABLED = "1"
-$env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
-$env:C_INCLUDE_PATH = "E:\onnxruntime-win-x64-1.21.0\include"
-$env:LIBRARY_PATH = "E:\onnxruntime-win-x64-1.21.0\lib"
+$env:PATH = "<gcc 所在目录>;$env:PATH"   # 如 WinLibs / msys2 mingw64/bin
 go mod tidy
 go build -o xiaozhi_server.exe ./cmd/server
 ```
+
+也可以改用环境变量方式（不落盘、每次会话设置）：
+
+```powershell
+$env:C_INCLUDE_PATH = "e:\workspace\go\xiaozhiServer\third_party\onnxruntime\win-x64\include"
+$env:LIBRARY_PATH = "e:\workspace\go\xiaozhiServer\third_party\onnxruntime\win-x64\lib"
+```
+
+运行时需要 `onnxruntime.dll`（在 `third_party/onnxruntime/win-x64/lib/`）与 `ten_vad.dll`（在 `lib/ten-vad/lib/Windows/x64/`）可被找到：与 `xiaozhi_server.exe` 放在同一目录，或加入 `PATH`。
 
 ### 启动
 

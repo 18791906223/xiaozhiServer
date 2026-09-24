@@ -303,7 +303,7 @@ llm:
   qwen_72b:
     type: "openai"                               # 接口类型
     model_name: "Qwen/Qwen2.5-72B-Instruct"     # 模型名称
-    api_key: "api_key"                           # API密钥
+    api_key: "sk-lrkqrhxonierkxplndptmogxabozgwrnfehyicdtompohkzl"                           # API密钥
     base_url: "https://api.siliconflow.cn/v1"    # API基础地址
     max_tokens: 500                              # 最大生成token数
   # ChatGLM模型配置（智谱AI）
@@ -318,7 +318,7 @@ llm:
     type: "openai"                               # 接口类型
     model_name: "qwen2.5-72b-instruct"          # 模型名称
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"  # API基础地址
-    api_key: "api_key"                           # API密钥
+    api_key: "sk-0920e69c9ee94b6f9e8fc12b54b58a89"                           # API密钥
     max_token: 500                               # 最大生成token数
   # 豆包DeepSeek模型配置
   doubao_deepseek:
