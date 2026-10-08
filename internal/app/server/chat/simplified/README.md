@@ -129,25 +129,26 @@ conn.Audio() → opusQueue → [processAudioLoop] 解码 + VAD
 
 ## 4. 分阶段实现（每个阶段一个 git commit）
 
-用 `git log --oneline` 看这一串提交，再用 `git show <hash>` 看每一步加了什么。
-每个阶段都配了会通过的测试，所以你可以 checkout 到任意一步并直接验证。
+用 `git log --oneline -- internal/app/server/chat/simplified` 看这一串提交，
+再用 `git show <hash>` 看每一步加了什么。每个阶段都配了会通过的测试，
+所以你可以 checkout 到任意一步并直接验证。
 
-| # | 提交 | 你会看到什么 | 对应测试 |
-|---|---|---|---|
-| 1 | 文档：路线图 | 本文件 | — |
-| 2 | 阶段 1：握手与文本指令 | WebSocket 服务、`hello` 握手、`listen` 分发。此时音频帧被直接丢弃 | `TestStage1_Handshake` |
-| 3 | 阶段 2：音频接入与 VAD | Opus 解码、能量 VAD、静音 400ms 判定「说完了」 | `TestStage2_*` |
-| 4 | 阶段 3：ASR | 抽出 `ASR` 接口，把 PCM 变成文本，回 `stt` | `TestStage3_*` |
-| 5 | 阶段 4：LLM 与分句 | 抽出 `LLM` 接口，流式 token 按标点切成句子 | `TestStage4_*` |
-| 6 | 阶段 5：TTS 与音频下发 | 抽出 `TTS` 接口，句子变成 Opus 帧发回设备，全链路打通 | `TestStage5_*` |
-| 7 | 阶段 6：打断 | 说话打断播报，轮次编号作废旧输出 | `TestStage6_*` |
-| 8 | 端到端与文档 | 完整消息序列测试、本文件补全 | `TestFullPipelineMessageSequence` |
+| 提交信息 | 你会看到什么 | 对应测试 |
+|---|---|---|
+| `docs(simplified): ...路线图` | 本文件 | — |
+| `feat(simplified): 阶段1 握手与文本指令` | WebSocket 服务、`hello` 握手、`listen` 分发。此时音频帧被直接丢弃 | `TestStage1_Handshake` |
+| `feat(simplified): 阶段2 Opus 解码、能量 VAD 与断句` | Opus 解码、能量 VAD、静音 400ms 判定「说完了」 | `TestStage2_*` |
+| `feat(simplified): 阶段3 抽出 ASR 接口` | ASR 接口 + 两种实现，把 PCM 变成文本，回 `stt` | `TestStage3_*` |
+| `feat(simplified): 阶段4 抽出 LLM 接口与流式分句` | LLM 接口 + 流式 token 按标点切成句子 | `TestStage4_*` |
+| `feat(simplified): 阶段5 抽出 TTS 接口` | TTS 接口 + 句子变成 Opus 帧发回设备，全链路打通 | `TestStage5_*` |
+| `feat(simplified): 阶段6 打断（barge-in）` | 说话打断播报，轮次编号作废旧输出 | `TestStage6_*` |
+| `docs(simplified): ...完整消息序列测试与文档补全` | 完整消息序列测试、本文件补全 | `TestFullPipelineMessageSequence` |
 
 建议的阅读方式：
 
 ```bash
 git log --oneline -- internal/app/server/chat/simplified
-git show <阶段N的hash>          # 看这一阶段改了什么
+git show <某个阶段的hash>       # 看这一阶段改了什么
 ```
 
 ---
