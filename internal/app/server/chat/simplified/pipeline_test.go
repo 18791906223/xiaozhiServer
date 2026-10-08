@@ -806,3 +806,59 @@ func TestStage6_VADMarkSpeakingThenSilence(t *testing.T) {
 		t.Fatalf("净语音时长不对: %d", spoken)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 完整链路：一次对话的消息序列到底长什么样
+// ---------------------------------------------------------------------------
+
+// TestFullPipelineMessageSequence 把一次完整对话的消息序列打印出来。
+// 想最快看清整条链路，直接看这个测试的输出：
+//
+//	go test ./internal/app/server/chat/simplified/ -run TestFullPipeline -v
+func TestFullPipelineMessageSequence(t *testing.T) {
+	url := startTestServer(t)
+	dev := dialDevice(t, url, "demo-device")
+
+	// ① 握手：设备上报音频格式，服务端回 session_id 和下行格式
+	dev.hello()
+	hello := dev.expectJSON(10*time.Second, SrvHello, "")
+	t.Logf("① 握手  session_id=%s  audio_params=%+v", hello.SessionID, hello.AudioParams)
+
+	// ② 开始收音，说 1 秒，停顿 600ms（超过 400ms 静音阈值 → 判定说完了）
+	dev.startListening()
+	dev.sendAudio(encodeOpus(t, speakTone(1000, 440)))
+	dev.sendAudio(encodeOpus(t, silence(600)))
+
+	// ③ 识别结果
+	stt := dev.expectJSON(10*time.Second, SrvStt, "")
+	t.Logf("③ 识别  %s", stt.Text)
+
+	// ④ 播报：tts/start → (sentence_start → 音频帧… → sentence_end)×N → tts/stop
+	msgs := dev.collectUntilFull(30*time.Second, SrvTts, StateStop)
+	audioFrames, sentences := 0, 0
+	for _, m := range msgs {
+		if m.audio != nil {
+			audioFrames++
+			continue
+		}
+		switch m.text.State {
+		case StateStart:
+			t.Log("④ 播报  tts/start")
+		case StateSentenceStart:
+			sentences++
+			t.Logf("        sentence_start  %q", m.text.Text)
+		case StateSentenceEnd:
+			// 音频必须夹在 sentence_start 和 sentence_end 之间
+			if audioFrames == 0 {
+				t.Fatalf("句子 %q 没有夹带音频", m.text.Text)
+			}
+			t.Logf("        sentence_end    %q（其间 %d 帧音频）", m.text.Text, audioFrames)
+			audioFrames = 0
+		case StateStop:
+			t.Log("        tts/stop —— 本轮结束，设备可以重新收音")
+		}
+	}
+	if sentences < 2 {
+		t.Fatalf("一句 40 字的回复应该被切成不止一句，实际 %d 句", sentences)
+	}
+}
