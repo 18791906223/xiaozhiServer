@@ -46,17 +46,27 @@ type session struct {
 	opusQueue chan []byte
 
 	vad *vad
+	// bargeVad 专用于「播报期间」的插话检测，和收音用的 vad 分开，
+	// 免得两边的静音计时互相污染。
+	bargeVad *vad
 
-	// mu 保护下面这几个跨 goroutine 的状态
-	// （handleCmdLoop 会改 listening，processAudioLoop 会改 collecting/utterance）
+	// mu 保护下面这些跨 goroutine 的状态。
+	// handleCmdLoop / processAudioLoop / 每轮的播报 goroutine 都会碰它们。
 	mu         sync.Mutex
 	listening  bool      // 处于 listen start 和 listen stop 之间
 	collecting bool      // 正在攒一段语音
 	utterance  []float32 // 攒下来的 PCM
+	speaking   bool      // 助手正在生成/下发回复（播报中）
+	gen        int64     // 当前轮次编号，每开始一轮播报 +1
+	turnCancel context.CancelFunc
 
 	ctx    context.Context
 	cancel context.CancelFunc
 }
+
+// bargeInSpeechMs 是「插话」需要持续说话多久才成立。
+// 真实实现里对应 realtime_mode=1 那个分支的 360ms 阈值。
+const bargeInSpeechMs = 240
 
 func newSession(conn *transport, deviceID string) *session {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -68,6 +78,7 @@ func newSession(conn *transport, deviceID string) *session {
 		outFormat: outAudioFormat,
 		opusQueue: make(chan []byte, 100),
 		vad:       newVAD(),
+		bargeVad:  newVAD(),
 		asr:       appConfig.newASR(),
 		llm:       appConfig.newLLM(),
 		ctx:       ctx,
@@ -135,7 +146,8 @@ func (s *session) handleClientMessage(msg *ClientMessage) {
 	case MsgListen:
 		s.handleListen(msg)
 	case MsgAbort:
-		log.Printf("[%s] 收到 abort（打断），阶段 6 实现", s.deviceID)
+		// 设备侧的打断请求（用户又按了一次按键、或设备自己判断该插话）
+		s.interrupt("收到 abort")
 	case MsgGoodbye:
 		log.Printf("[%s] 收到 goodbye，主动断开", s.deviceID)
 		s.conn.Close()
@@ -182,9 +194,18 @@ func (s *session) handleHello(msg *ClientMessage) {
 //	state = start → 开始收音
 //	state = stop  → 用户松手，本轮语音立刻结束（不等 VAD 的静音超时）
 //	state = detect → 设备侧唤醒词检测结果，简化版不用
+//
+// 注意这里有个隐藏的时序前提：`listen start`（文本帧）和紧随其后的音频帧
+// （二进制帧）是由两个独立的消费循环处理的，所以从收到 listen start 到
+// listening 真正置为 true 之间有几微秒的空窗，这期间的音频帧会被丢掉。
+// 真实实现同样是这个结构，靠「设备不会在发起收音的同一瞬间就开始灌音频」
+// 以及首帧预滚缓冲来规避。这里也依赖设备端先建立收音状态。
 func (s *session) handleListen(msg *ClientMessage) {
 	switch msg.State {
 	case StateStart:
+		// 设备开始新一轮收音。如果助手还在说话，先把它打断 ——
+		// 唤醒词一响就该闭嘴，这是「打断」最常见的触发方式。
+		s.interrupt("设备开始新一轮收音")
 		s.beginTurn()
 		log.Printf("[%s] listen start（mode=%s）", s.deviceID, msg.Mode)
 	case StateStop:
@@ -224,7 +245,81 @@ func (s *session) endTurn(reason string) {
 		return
 	}
 	log.Printf("[%s] 本轮收音结束（%s）", s.deviceID, reason)
-	s.recognize(pcm)
+	// 放到 goroutine 里跑：识别 + 请求 LLM + 播报可能要好几秒，
+	// 堵在这里的话 handleCmdLoop 就没法处理下一句指令了 ——
+	// 连「打断」都会收不到。
+	go s.recognize(pcm)
+}
+
+// interrupt 打断正在进行的播报。
+//
+// 对应真实实现 common.go 的 stopSpeaking + tts.go 的
+// InterruptAndStopSyncWithReason。真实实现要：取消两个 context、
+// 清空四个队列（chatTextQueue / llmResponseQueue / ttsQueue /
+// sessionAudioQueue）、挂起媒体播放、同步等发送循环停下来，
+// 最后只补一个 tts/stop。
+//
+// 简化版的机制是「轮次编号」：每开始一轮播报 gen+1。
+// 被打断的那一轮发现自己的 gen 已经不是当前值，就把还没发出去的
+// 音频帧全部丢掉 —— 这正是真实实现里 audioGeneration 计数器的做法。
+func (s *session) interrupt(reason string) {
+	s.mu.Lock()
+	if !s.speaking {
+		s.mu.Unlock()
+		return // 没有在播报，没什么可打断的
+	}
+	s.gen++ // 旧轮次就此作废
+	s.speaking = false
+	cancel := s.turnCancel
+	s.turnCancel = nil
+	s.mu.Unlock()
+
+	log.Printf("[%s] 打断播报（%s）", s.deviceID, reason)
+	if cancel != nil {
+		cancel() // 取消 LLM 流式请求和 TTS 合成
+	}
+	// 立刻告诉设备停止播放。旧轮次的收尾会因为 gen 已过期而跳过，
+	// 所以设备只会收到这一个 tts/stop。
+	s.reply(ServerMessage{Type: SrvTts, State: StateStop})
+}
+
+// beginSpeaking 登记「助手开始播报」，并给这一轮分配一个编号。
+func (s *session) beginSpeaking(parent context.Context) (int64, context.Context) {
+	turnCtx, cancel := context.WithCancel(parent)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gen++
+	s.speaking = true
+	s.turnCancel = cancel
+	return s.gen, turnCtx
+}
+
+// endSpeaking 播报正常收尾。
+// 如果这一轮已经被打断（编号已经变了）就直接返回 ——
+// 打断时已经发过 tts/stop，这里不能再发第二次。
+func (s *session) endSpeaking(gen int64) {
+	s.mu.Lock()
+	stale := s.gen != gen
+	if !stale {
+		s.speaking = false
+		s.turnCancel = nil
+	}
+	s.mu.Unlock()
+
+	if stale {
+		return
+	}
+	s.reply(ServerMessage{Type: SrvTts, State: StateStop})
+}
+
+// isCurrent 判断某一轮是否还是「当前轮」。
+// 被打断之后旧轮次就过期了，它剩下的音频一帧都不能再发出去 ——
+// 否则设备会把「上一句没播完的回答」和新回答混在一起。
+func (s *session) isCurrent(gen int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gen == gen
 }
 
 // handleAudioLoop 消费设备上传的 Opus 音频帧，转手塞进 opusQueue。
@@ -238,11 +333,12 @@ func (s *session) handleAudioLoop() {
 		case <-s.ctx.Done():
 			return
 		case frame := <-s.conn.Audio():
+			// 播报期间也要收帧：用户可能正在插话，得能听见他。
 			s.mu.Lock()
-			listening := s.listening
+			accept := s.listening || s.speaking
 			s.mu.Unlock()
-			if !listening {
-				continue // 不在收音窗口内，直接丢弃
+			if !accept {
+				continue // 既没在收音也没在播报，直接丢弃
 			}
 			select {
 			case s.opusQueue <- frame:
@@ -281,20 +377,42 @@ func (s *session) processAudioLoop() {
 	}
 }
 
-// handlePCM 处理一帧 PCM：跑 VAD，决定是攒着还是收尾。
+// handlePCM 处理一帧 PCM。
+//
+// 分两种情况 —— 这是真实实现里最容易被忽略的一段逻辑：
+//   - 播报期间：只做「插话检测」，不攒语音
+//   - 收音期间：跑 VAD 断句，攒够一句话就送去识别
 func (s *session) handlePCM(pcm []float32) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// 本轮已经结束（或还没开始），队列里剩下的帧直接丢掉。
-	// 队列里很可能还压着上一轮遗留的音频。
-	if !s.listening {
+	switch {
+	case s.speaking && !s.listening:
+		// 助手正在说话，此时收到音频 —— 用户可能是在插话
+		s.mu.Unlock()
+		s.detectBargeIn(pcm)
+		return
+	case !s.listening:
+		// 既没在收音也没在播报，丢掉（队列里常压着上一轮的残留音频）
+		s.mu.Unlock()
 		return
 	}
+	s.mu.Unlock()
 
+	s.collectSpeech(pcm)
+}
+
+// collectSpeech 是收音期间的核心逻辑：跑 VAD，把 PCM 攒成一句话。
+func (s *session) collectSpeech(pcm []float32) {
 	frameMs := len(pcm) / s.inCodec.samplesPerMs() // 60ms 一帧 → 960/16
 
 	result, spokenMs := s.vad.Push(pcm, frameMs)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 等锁的这段时间里本轮可能已经结束了（设备发了 listen stop，或 VAD 已收尾）
+	if !s.listening {
+		return
+	}
 
 	switch result {
 	case vadSpeech:
@@ -328,6 +446,38 @@ func (s *session) handlePCM(pcm []float32) {
 			s.utterance = append(s.utterance, pcm...)
 		}
 	}
+}
+
+// detectBargeIn 在助手播报期间判断用户有没有插话。
+//
+// 对应真实实现 asr.go 里 realtime_mode=1 的分支：
+// 连续检测到 360ms 人声就调用 StopAssistantOutputAfterAsrWithReason。
+// 真实实现还有好几种触发方式（首字识别结果、声纹比对、设备 abort、
+// 收到新的 listen start），简化版实现其中最直观的一种 + abort。
+//
+// 注意这里用独立的 bargeVad：收音用的那个 vad 有自己的静音计时，
+// 两个逻辑混用会互相把状态清掉。
+func (s *session) detectBargeIn(pcm []float32) {
+	frameMs := len(pcm) / s.inCodec.samplesPerMs()
+	s.bargeVad.Push(pcm, frameMs)
+	if s.bargeVad.SpeechMs() < bargeInSpeechMs {
+		return // 才响了一两帧，可能只是碰了一下麦克风
+	}
+	s.bargeVad.Reset()
+
+	s.interrupt("用户在播报期间说话了")
+
+	// 打断之后立刻转入收音，把用户正在说的这句接住 ——
+	// 不然「等一下」这三个字会被当成噪音丢掉，用户得再说一遍。
+	s.mu.Lock()
+	s.listening = true
+	s.collecting = true
+	s.utterance = append(s.utterance, pcm...)
+	s.mu.Unlock()
+
+	// 关键：告诉 VAD「已经在说话中间了」。
+	// 否则用户如果就此停下，后面全是静音，VAD 永远判不出「说完了」。
+	s.vad.MarkSpeaking(bargeInSpeechMs)
 }
 
 // recognize 把一整段语音变成文本，然后交给大模型。
@@ -367,6 +517,9 @@ func (s *session) recognize(pcm []float32) {
 //	tts/sentence_start「第一句」 + 音频 + tts/sentence_end
 //	tts/sentence_start「第二句」 + 音频 + tts/sentence_end
 //	tts/stop
+//
+// 这一轮随时可能被打断（见 interrupt），所以每个下发动作前都要
+// 问一句「我还是当前轮吗」—— 用 gen 这个编号来回答。
 func (s *session) replyWithLLM(ctx context.Context, userText string) {
 	messages := s.buildMessages(userText)
 
@@ -376,6 +529,12 @@ func (s *session) replyWithLLM(ctx context.Context, userText string) {
 		return
 	}
 
+	gen, turnCtx := s.beginSpeaking(ctx)
+	defer s.endSpeaking(gen)
+
+	if turnCtx.Err() != nil {
+		return // 刚开始就被打断了
+	}
 	log.Printf("[%s] 开始播报（%s）", s.deviceID, s.llm.Name())
 	s.reply(ServerMessage{Type: SrvTts, State: StateStart})
 
@@ -386,18 +545,19 @@ func (s *session) replyWithLLM(ctx context.Context, userText string) {
 		// 每收到一小段，就看有没有攒出完整的句子 —— 有就立刻合成、立刻下发。
 		// 这一步是「边说边播」的关键：不用等整段回复写完。
 		for _, sentence := range splitter.Push(delta) {
-			s.speakSentence(ctx, sentence)
+			s.speakSentence(turnCtx, gen, sentence)
 		}
-		if ctx.Err() != nil {
-			break // 被打断（阶段 6）
+		if turnCtx.Err() != nil {
+			break // 被打断了，剩下的 token 直接扔掉
 		}
 	}
 	// 最后一句通常不带句末标点，别忘了。
-	if tail := splitter.Flush(); tail != "" && ctx.Err() == nil {
-		s.speakSentence(ctx, tail)
+	if tail := splitter.Flush(); tail != "" && turnCtx.Err() == nil {
+		s.speakSentence(turnCtx, gen, tail)
 	}
 
-	s.reply(ServerMessage{Type: SrvTts, State: StateStop})
+	// 打断时也要把已经说出去的部分记进历史 ——
+	// 用户听到的就是这些，上下文应该和用户听到的一致。
 	s.appendMessage(message{Role: "assistant", Content: reply.String()})
 }
 
@@ -436,12 +596,14 @@ func (s *session) appendMessage(m message) {
 // runSenderLoop 那条链路。
 //
 // 真实实现的音频要经过好几级队列（ttsQueue → sessionAudioQueue → socket），
-// 由专门的发送循环按播放节奏控制发送速度；简化版直接同步写下去，
+// 由专门的发送循环按播放节奏发送；简化版直接同步写下去，
 // 顺序一样，只是没有「提前缓冲」的优化。
 //
-// 阶段 5 补上了中间那段音频 —— 这正是设备判断「一句话说完了没有」的依据：
-// 它收到 sentence_end 就知道这句的音频到齐了。
-func (s *session) speakSentence(ctx context.Context, sentence string) {
+// 每发一帧都要检查 gen：这一句很可能说到一半就被用户打断了。
+func (s *session) speakSentence(ctx context.Context, gen int64, sentence string) {
+	if !s.isCurrent(gen) {
+		return
+	}
 	s.reply(ServerMessage{Type: SrvTts, State: StateSentenceStart, Text: sentence})
 
 	frames, err := s.tts.Synthesize(ctx, sentence)
@@ -449,17 +611,21 @@ func (s *session) speakSentence(ctx context.Context, sentence string) {
 		log.Printf("[%s] 语音合成失败（%s）: %v", s.deviceID, s.tts.Name(), err)
 		frames = nil
 	}
+
 	sent := 0
 	if frames != nil {
 		for frame := range frames {
-			if ctx.Err() != nil {
-				break
+			if !s.isCurrent(gen) {
+				break // 被打断，剩下的帧一帧都不发
 			}
 			s.sendAudio(frame)
 			sent++
 		}
 	}
 
+	if !s.isCurrent(gen) {
+		return // 已被打断：不补 sentence_end，打断流程会补一个 tts/stop
+	}
 	if sent == 0 {
 		log.Printf("[%s] 这一句没有产出音频: %q", s.deviceID, sentence)
 	}

@@ -84,6 +84,23 @@ func (v *vad) Reset() {
 	v.silenceMs = 0
 }
 
+// MarkSpeaking 告诉 VAD「当前已经处于一段语音中间，且已经说了 speechMs 毫秒」。
+//
+// 用于「用户插话打断播报」的场景：我们已经确认他在说话，但 VAD 是刚重置的。
+// 如果不补上这个状态，而用户接下来正好说完了（后面全是静音），
+// Push 会一直返回 vadSilence（因为 v.speaking 是 false），
+// 永远判不出「说完了」，这一轮就丢了。
+func (v *vad) MarkSpeaking(speechMs int) {
+	v.speaking = true
+	v.speechMs = speechMs
+	v.silenceMs = 0
+}
+
+// SpeechMs 返回当前这一段已经累计说了多久（毫秒）。
+// 「打断播报」用它来判断用户是不是持续在说话，
+// 而不是只碰了一下麦克风就被当成插话。
+func (v *vad) SpeechMs() int { return v.speechMs }
+
 // rms 计算一帧的均方根能量，落在 [0,1]。这就是「音量大小」。
 // 真实实现把这一帧喂给神经网络，这里只需要一个数字。
 func rms(pcm []float32) float32 {

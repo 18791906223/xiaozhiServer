@@ -71,6 +71,19 @@ func (d *device) listen(state string) {
 	d.sendJSON(ClientMessage{Type: MsgListen, State: state, Mode: "auto"})
 }
 
+// startListening 模拟真实设备：先发 listen start，稍等片刻再开始推音频流。
+//
+// 这一步不是为了「凑时间」，而是必须的：服务端的控制帧和音频帧由两个
+// 独立的消费循环处理（cmdMessageLoop / audioMessageLoop），如果设备把
+// listen start 和 24 帧音频在同一毫秒内一起发出来，音频循环有可能先跑完，
+// 此时服务端还没把 listening 置为 true，整段音频就被丢掉了。
+// 真实设备本来就是「先建立收音状态，麦克风数据随后才到」。
+func (d *device) startListening() {
+	d.t.Helper()
+	d.listen(StateStart)
+	time.Sleep(80 * time.Millisecond)
+}
+
 func (d *device) sendJSON(msg ClientMessage) {
 	d.t.Helper()
 	data, err := json.Marshal(msg)
@@ -239,7 +252,7 @@ func TestStage2_SpeechEndTriggersRecognition(t *testing.T) {
 	dev.hello()
 	dev.expectJSON(3*time.Second, SrvHello, "")
 
-	dev.listen(StateStart)
+	dev.startListening()
 	// 说 1 秒（模拟人声的 440Hz 正弦波）
 	dev.sendAudio(encodeOpus(t, speakTone(1000, 440)))
 	// 再静音 600ms —— 超过 400ms 的静音阈值，VAD 应判定「说完了」
@@ -258,7 +271,7 @@ func TestStage2_ShortNoiseDoesNotTrigger(t *testing.T) {
 	dev.hello()
 	dev.expectJSON(3*time.Second, SrvHello, "")
 
-	dev.listen(StateStart)
+	dev.startListening()
 	// 只响 100ms —— 短于 minSpeech(200ms)，应被当作噪声丢掉
 	dev.sendAudio(encodeOpus(t, speakTone(100, 440)))
 	dev.sendAudio(encodeOpus(t, silence(600)))
@@ -459,7 +472,7 @@ func TestStage4_EndToEndText(t *testing.T) {
 	dev.hello()
 	dev.expectJSON(3*time.Second, SrvHello, "")
 
-	dev.listen(StateStart)
+	dev.startListening()
 	dev.sendAudio(encodeOpus(t, speakTone(800, 440)))
 	dev.sendAudio(encodeOpus(t, silence(600)))
 
@@ -608,7 +621,7 @@ func TestStage5_EndToEndAudio(t *testing.T) {
 	dev.hello()
 	dev.expectJSON(3*time.Second, SrvHello, "")
 
-	dev.listen(StateStart)
+	dev.startListening()
 	dev.sendAudio(encodeOpus(t, speakTone(800, 440)))
 	dev.sendAudio(encodeOpus(t, silence(600)))
 
@@ -660,5 +673,136 @@ func TestStage5_EndToEndAudio(t *testing.T) {
 	}
 	if rms(pcm) <= 0.01 {
 		t.Fatal("第一帧音频是静音")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 阶段 6：打断
+// ---------------------------------------------------------------------------
+
+// startPlaying 让设备问一句，并等到助手真的开始播报为止。
+func startPlaying(t *testing.T, dev *device) {
+	t.Helper()
+	dev.startListening()
+	dev.sendAudio(encodeOpus(t, speakTone(800, 440)))
+	dev.sendAudio(encodeOpus(t, silence(600)))
+	dev.expectJSON(3*time.Second, SrvStt, "")
+	dev.expectJSON(5*time.Second, SrvTts, StateStart)
+	dev.expectJSON(5*time.Second, SrvTts, StateSentenceStart)
+}
+
+// assertSilent 断言在 wait 时间内既没有音频帧，也没有新的句子开始/结束。
+// 用来验证「打断之后旧轮次的音频确实停了」。
+func assertSilent(t *testing.T, dev *device, wait time.Duration) {
+	t.Helper()
+	_ = dev.conn.SetReadDeadline(time.Now().Add(wait))
+	for {
+		msgType, data, err := dev.conn.ReadMessage()
+		if err != nil {
+			return // 读到超时 = 确实安静了，这正是期望的结果
+		}
+		if msgType == websocket.BinaryMessage {
+			t.Fatalf("打断之后仍收到 %d 字节音频", len(data))
+		}
+		var msg ServerMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			t.Fatalf("解析失败: %v", err)
+		}
+		if msg.State == StateSentenceStart || msg.State == StateSentenceEnd {
+			t.Fatalf("打断之后仍收到 %s/%s: %q", msg.Type, msg.State, msg.Text)
+		}
+	}
+}
+
+func TestStage6_BargeInByVoice(t *testing.T) {
+	url := startTestServer(t)
+	dev := dialDevice(t, url, "test-device-bargein")
+	dev.hello()
+	dev.expectJSON(3*time.Second, SrvHello, "")
+	startPlaying(t, dev)
+
+	// 用户在助手播报期间持续说话 600ms（远超 240ms 的插话阈值）
+	dev.sendAudio(encodeOpus(t, speakTone(600, 440)))
+
+	// 应当收到打断产生的 tts/stop，而不是等整段播报自然结束
+	dev.expectJSON(5*time.Second, SrvTts, StateStop)
+	assertSilent(t, dev, 400*time.Millisecond)
+}
+
+func TestStage6_BargeInSpeechBecomesNewTurn(t *testing.T) {
+	url := startTestServer(t)
+	dev := dialDevice(t, url, "test-device-bargein-2")
+	dev.hello()
+	dev.expectJSON(3*time.Second, SrvHello, "")
+	startPlaying(t, dev)
+
+	dev.sendAudio(encodeOpus(t, speakTone(600, 440)))
+	dev.expectJSON(5*time.Second, SrvTts, StateStop)
+
+	// 用户把插话说完，静音之后应当被当成新的一轮送去识别 ——
+	// 而不是要求用户把刚才那句再说一遍。
+	dev.sendAudio(encodeOpus(t, silence(700)))
+	stt := dev.expectJSON(5*time.Second, SrvStt, "")
+	if !strings.Contains(stt.Text, "模拟识别") {
+		t.Fatalf("插话内容没有被识别: %q", stt.Text)
+	}
+	t.Logf("插话被识别为: %s", stt.Text)
+}
+
+func TestStage6_ShortBlipDoesNotInterrupt(t *testing.T) {
+	url := startTestServer(t)
+	dev := dialDevice(t, url, "test-device-blip")
+	dev.hello()
+	dev.expectJSON(3*time.Second, SrvHello, "")
+	startPlaying(t, dev)
+
+	// 只响一帧（60ms，低于 240ms 阈值），不该打断播报
+	dev.sendAudio(encodeOpus(t, speakTone(60, 440)))
+
+	// 播报应该正常走完：模拟回复一共 3 句，
+	// 其中第 1 句的 sentence_start 已经在 startPlaying 里被读掉了。
+	msgs := dev.collectUntilFull(20*time.Second, SrvTts, StateStop)
+	sentences := 1
+	for _, m := range msgs {
+		if m.audio == nil && m.text.State == StateSentenceStart {
+			sentences++
+		}
+	}
+	if sentences < 3 {
+		t.Fatalf("短暂噪声不该打断播报，实际只播了 %d 句", sentences)
+	}
+}
+
+func TestStage6_AbortMessage(t *testing.T) {
+	url := startTestServer(t)
+	dev := dialDevice(t, url, "test-device-abort")
+	dev.hello()
+	dev.expectJSON(3*time.Second, SrvHello, "")
+	startPlaying(t, dev)
+
+	// 设备侧主动打断
+	dev.sendJSON(ClientMessage{Type: MsgAbort})
+	dev.expectJSON(5*time.Second, SrvTts, StateStop)
+	assertSilent(t, dev, 400*time.Millisecond)
+}
+
+func TestStage6_VADMarkSpeakingThenSilence(t *testing.T) {
+	v := newVAD()
+	// 模拟「用户插话打断播报」：已经确认他说了 bargeInSpeechMs 那么久。
+	// 接下来如果他直接住口（不再有语音帧），也必须能判出「说完了」。
+	v.MarkSpeaking(bargeInSpeechMs)
+
+	var (
+		got    = vadSilence
+		spoken int
+	)
+	for i := 0; i < 20 && got != vadSpeechEnd; i++ {
+		got, spoken = v.Push(silence(60), 60)
+	}
+	if got != vadSpeechEnd {
+		t.Fatal("MarkSpeaking 之后只发静音，应当能判出「说完了」")
+	}
+	if spoken != bargeInSpeechMs {
+		t.Fatalf("净语音时长不对: %d", spoken)
 	}
 }
