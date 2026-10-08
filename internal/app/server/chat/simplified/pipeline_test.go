@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -114,14 +114,9 @@ func encodeOpus(t *testing.T, pcm []float32) [][]byte {
 	return frames
 }
 
-// tone 生成一段正弦波，振幅 0.5 —— 远高于 VAD 阈值，模拟人声。
-func tone(ms int, freq float64) []float32 {
-	n := inAudioFormat.SampleRate * ms / 1000
-	out := make([]float32, n)
-	for i := range out {
-		out[i] = 0.5 * float32(math.Sin(2*math.Pi*freq*float64(i)/float64(inAudioFormat.SampleRate)))
-	}
-	return out
+// speakTone 生成一段「人声」（正弦波），振幅 0.5 —— 远高于 VAD 阈值。
+func speakTone(ms int, freq float64) []float32 {
+	return tone(ms, inAudioFormat.SampleRate, freq)
 }
 
 // silence 生成一段静音。
@@ -176,6 +171,40 @@ func (d *device) collectUntil(wait time.Duration, wantType, wantState string) []
 	return nil
 }
 
+// received 是设备收到的一条消息：要么是 JSON 文本，要么是一帧音频。
+type received struct {
+	text  ServerMessage
+	audio []byte
+}
+
+// collectUntilFull 和 collectUntil 一样，但会连音频帧一起收集。
+func (d *device) collectUntilFull(wait time.Duration, wantType, wantState string) []received {
+	d.t.Helper()
+	deadline := time.Now().Add(wait)
+	var got []received
+	for time.Now().Before(deadline) {
+		_ = d.conn.SetReadDeadline(time.Now().Add(time.Until(deadline)))
+		msgType, data, err := d.conn.ReadMessage()
+		if err != nil {
+			d.t.Fatalf("读取失败: %v（已收到 %d 条）", err, len(got))
+		}
+		if msgType == websocket.BinaryMessage {
+			got = append(got, received{audio: data})
+			continue
+		}
+		var msg ServerMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			d.t.Fatalf("解析失败: %v，原文: %s", err, data)
+		}
+		got = append(got, received{text: msg})
+		if msg.Type == wantType && (wantState == "" || msg.State == wantState) {
+			return got
+		}
+	}
+	d.t.Fatalf("等待 %s/%s 超时，已收到 %d 条消息", wantType, wantState, len(got))
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // 阶段 1：握手与文本指令
 // ---------------------------------------------------------------------------
@@ -212,7 +241,7 @@ func TestStage2_SpeechEndTriggersRecognition(t *testing.T) {
 
 	dev.listen(StateStart)
 	// 说 1 秒（模拟人声的 440Hz 正弦波）
-	dev.sendAudio(encodeOpus(t, tone(1000, 440)))
+	dev.sendAudio(encodeOpus(t, speakTone(1000, 440)))
 	// 再静音 600ms —— 超过 400ms 的静音阈值，VAD 应判定「说完了」
 	dev.sendAudio(encodeOpus(t, silence(600)))
 
@@ -231,7 +260,7 @@ func TestStage2_ShortNoiseDoesNotTrigger(t *testing.T) {
 
 	dev.listen(StateStart)
 	// 只响 100ms —— 短于 minSpeech(200ms)，应被当作噪声丢掉
-	dev.sendAudio(encodeOpus(t, tone(100, 440)))
+	dev.sendAudio(encodeOpus(t, speakTone(100, 440)))
 	dev.sendAudio(encodeOpus(t, silence(600)))
 
 	// 不该收到 stt；用一个很短的超时确认「什么都没有」
@@ -246,7 +275,7 @@ func TestStage2_ShortNoiseDoesNotTrigger(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestStage3_WAVHeader(t *testing.T) {
-	pcm := tone(100, 440) // 100ms @16kHz 单声道 = 1600 个采样点
+	pcm := speakTone(100, 440) // 100ms @16kHz 单声道 = 1600 个采样点
 	wav := pcmToWAV(pcm, 16000, 1)
 
 	if got := string(wav[0:4]); got != "RIFF" {
@@ -295,7 +324,7 @@ func TestStage3_OpenAIASRRequestShape(t *testing.T) {
 	defer ts.Close()
 
 	a := newOpenAIASR(ts.URL, "test-key", "whisper-1")
-	text, err := a.Recognize(context.Background(), tone(500, 440))
+	text, err := a.Recognize(context.Background(), speakTone(500, 440))
 	if err != nil {
 		t.Fatalf("识别失败: %v", err)
 	}
@@ -325,7 +354,7 @@ func TestStage3_MockASRErrorPropagation(t *testing.T) {
 	defer ts.Close()
 
 	a := newOpenAIASR(ts.URL, "k", "m")
-	if _, err := a.Recognize(context.Background(), tone(100, 440)); err == nil {
+	if _, err := a.Recognize(context.Background(), speakTone(100, 440)); err == nil {
 		t.Fatal("期望返回错误，实际为 nil")
 	}
 }
@@ -431,7 +460,7 @@ func TestStage4_EndToEndText(t *testing.T) {
 	dev.expectJSON(3*time.Second, SrvHello, "")
 
 	dev.listen(StateStart)
-	dev.sendAudio(encodeOpus(t, tone(800, 440)))
+	dev.sendAudio(encodeOpus(t, speakTone(800, 440)))
 	dev.sendAudio(encodeOpus(t, silence(600)))
 
 	stt := dev.expectJSON(3*time.Second, SrvStt, "")
@@ -468,4 +497,168 @@ func TestStage4_EndToEndText(t *testing.T) {
 		}
 	}
 	t.Logf("分句结果（%d 句）: %q", len(sentences), sentences)
+}
+
+// ---------------------------------------------------------------------------
+// 阶段 5：TTS 与音频下发
+// ---------------------------------------------------------------------------
+
+func TestStage5_Resampler(t *testing.T) {
+	// 24kHz → 16kHz：每 3 个输入采样点产出 2 个输出采样点
+	in := tone(100, 24000, 440) // 2400 个采样点
+
+	whole := newResampler(24000, 16000)
+	wholeOut := whole.Push(in)
+	if n := len(wholeOut); n < 1500 || n > 1620 {
+		t.Fatalf("整块重采样输出点数不对: %d（期望约 1600）", n)
+	}
+
+	// 分块喂入必须和整块喂入结果一致 —— 否则跨块状态处理有 bug
+	chunked := newResampler(24000, 16000)
+	var chunkedOut []float32
+	for i := 0; i < len(in); i += 100 {
+		end := i + 100
+		if end > len(in) {
+			end = len(in)
+		}
+		chunkedOut = append(chunkedOut, chunked.Push(in[i:end])...)
+	}
+	if len(chunkedOut) != len(wholeOut) {
+		t.Fatalf("分块与整块输出长度不同: %d vs %d", len(chunkedOut), len(wholeOut))
+	}
+	for i := range wholeOut {
+		if d := wholeOut[i] - chunkedOut[i]; d > 1e-6 || d < -1e-6 {
+			t.Fatalf("第 %d 个采样点不一致: %v vs %v", i, wholeOut[i], chunkedOut[i])
+		}
+	}
+}
+
+func TestStage5_OpenAITTSStreamAndResample(t *testing.T) {
+	const srcRate = 24000
+
+	// 假的 TTS 服务：返回 24kHz 的 440Hz 正弦波（300ms）
+	var body bytes.Buffer
+	for _, s := range tone(300, srcRate, 440) {
+		_ = binary.Write(&body, binary.LittleEndian, floatToInt16(s))
+	}
+	srcAudio := body.Bytes()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/audio/speech" {
+			t.Errorf("请求路径不对: %s", r.URL.Path)
+		}
+		var req struct {
+			Model          string `json:"model"`
+			Input          string `json:"input"`
+			Voice          string `json:"voice"`
+			ResponseFormat string `json:"response_format"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("解析请求失败: %v", err)
+			return
+		}
+		if req.Input != "你好" || req.ResponseFormat != "pcm" || req.Voice != "test-voice" {
+			t.Errorf("请求体不符合预期: %+v", req)
+		}
+		// 故意分两次写出，模拟流式返回
+		_, _ = w.Write(srcAudio[:1000])
+		w.(http.Flusher).Flush()
+		_, _ = w.Write(srcAudio[1000:])
+	}))
+	defer ts.Close()
+
+	outC, err := newCodec(outAudioFormat)
+	if err != nil {
+		t.Fatalf("建编解码器失败: %v", err)
+	}
+	tts := newOpenAITTS(ts.URL, "k", "test-model", "test-voice", srcRate, outC)
+
+	frames, err := tts.Synthesize(context.Background(), "你好")
+	if err != nil {
+		t.Fatalf("合成失败: %v", err)
+	}
+
+	dec, _ := newCodec(outAudioFormat)
+	var total int
+	var peak float32
+	for frame := range frames {
+		pcm, err := dec.decode(frame)
+		if err != nil {
+			t.Fatalf("解码失败: %v", err)
+		}
+		total += len(pcm)
+		if e := rms(pcm); e > peak {
+			peak = e
+		}
+	}
+
+	// 300ms @16kHz = 4800 个采样点（最后一帧会补零，允许一点误差）
+	if total < 4300 || total > 5300 {
+		t.Fatalf("重采样后的总时长不对: %d 个采样点（期望约 4800）", total)
+	}
+	if peak < 0.05 {
+		t.Fatalf("重采样/解码后能量过低（听起来会像没声音）: %v", peak)
+	}
+	t.Logf("合成得到 %d 个采样点，峰值 %.3f", total, peak)
+}
+
+func TestStage5_EndToEndAudio(t *testing.T) {
+	url := startTestServer(t)
+	dev := dialDevice(t, url, "test-device-tts")
+	dev.hello()
+	dev.expectJSON(3*time.Second, SrvHello, "")
+
+	dev.listen(StateStart)
+	dev.sendAudio(encodeOpus(t, speakTone(800, 440)))
+	dev.sendAudio(encodeOpus(t, silence(600)))
+
+	dev.expectJSON(3*time.Second, SrvStt, "")
+	msgs := dev.collectUntilFull(20*time.Second, SrvTts, StateStop)
+
+	var (
+		sentences   int
+		audioFrames int
+		perSentence int
+		firstAudio  []byte
+		totalAudio  int
+	)
+	for _, m := range msgs {
+		if m.audio != nil {
+			audioFrames++
+			perSentence++
+			totalAudio += len(m.audio)
+			if firstAudio == nil {
+				firstAudio = m.audio
+			}
+			continue
+		}
+		switch m.text.State {
+		case StateSentenceStart:
+			perSentence = 0
+		case StateSentenceEnd:
+			sentences++
+			// 每一句都必须夹着音频，否则设备那端是「哑」的
+			if perSentence == 0 {
+				t.Fatalf("句子 %q 没有夹带任何音频", m.text.Text)
+			}
+		}
+	}
+
+	if sentences == 0 {
+		t.Fatal("没有收到任何句子")
+	}
+	if firstAudio == nil {
+		t.Fatal("没有收到任何音频帧")
+	}
+	t.Logf("共 %d 句，%d 帧音频，共 %d 字节", sentences, audioFrames, totalAudio)
+
+	// 把第一帧解出来，确认里面真的是声音而不是静音
+	dec, _ := newCodec(outAudioFormat)
+	pcm, err := dec.decode(firstAudio)
+	if err != nil {
+		t.Fatalf("解码第一帧失败: %v", err)
+	}
+	if rms(pcm) <= 0.01 {
+		t.Fatal("第一帧音频是静音")
+	}
 }

@@ -26,12 +26,16 @@ type session struct {
 	inFormat  AudioFormat // 上行（设备 → 服务端）
 	outFormat AudioFormat // 下行（服务端 → 设备）
 
-	codec *codec // Opus 编解码，hello 拿到音频格式后创建
+	// 上下行各一个编解码器：上行按设备 hello 上报的格式解码，
+	// 下行按服务端下发的格式编码。两者格式不一定相同。
+	inCodec  *codec
+	outCodec *codec
 
 	// asr / llm / tts 是本轮对话流水线的三个环节，对应真实实现里的
 	// AsrProvider / LLMProvider / TTSProvider。
 	asr asrProvider
 	llm llmProvider
+	tts ttsProvider
 
 	// history 是最近几轮对话，作为上下文一并发给 LLM。
 	// 真实实现还要做工具消息对齐、超长裁剪、长期记忆注入。
@@ -56,7 +60,7 @@ type session struct {
 
 func newSession(conn *transport, deviceID string) *session {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &session{
+	s := &session{
 		conn:      conn,
 		deviceID:  deviceID,
 		sessionID: fmt.Sprintf("%s-%d", deviceID, time.Now().UnixNano()),
@@ -69,6 +73,11 @@ func newSession(conn *transport, deviceID string) *session {
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+	// 下行编解码器立刻就能建（格式由服务端决定）；
+	// 上行要等 hello 拿到设备上报的格式再建。
+	s.outCodec, _ = newCodec(s.outFormat)
+	s.tts = appConfig.newTTS(s.outCodec)
+	return s
 }
 
 // run 启动三个循环，然后阻塞到连接关闭。
@@ -155,7 +164,7 @@ func (s *session) handleHello(msg *ClientMessage) {
 		log.Printf("[%s] 创建 Opus 编解码器失败: %v", s.deviceID, err)
 		return
 	}
-	s.codec = c
+	s.inCodec = c
 
 	log.Printf("[%s] hello，上行音频格式: %+v", s.deviceID, s.inFormat)
 
@@ -259,10 +268,10 @@ func (s *session) processAudioLoop() {
 		case <-s.ctx.Done():
 			return
 		case frame := <-s.opusQueue:
-			if s.codec == nil {
+			if s.inCodec == nil {
 				continue // 还没收到 hello，不知道音频格式
 			}
-			pcm, err := s.codec.decode(frame)
+			pcm, err := s.inCodec.decode(frame)
 			if err != nil {
 				log.Printf("[%s] Opus 解码失败: %v", s.deviceID, err)
 				continue
@@ -283,7 +292,7 @@ func (s *session) handlePCM(pcm []float32) {
 		return
 	}
 
-	frameMs := len(pcm) / s.codec.samplesPerMs() // 60ms 一帧 → 960/16
+	frameMs := len(pcm) / s.inCodec.samplesPerMs() // 60ms 一帧 → 960/16
 
 	result, spokenMs := s.vad.Push(pcm, frameMs)
 
@@ -305,7 +314,7 @@ func (s *session) handlePCM(pcm []float32) {
 
 		// 尾部那段静音对识别没用，按 VAD 给出的净语音时长裁掉，
 		// 这样送进 ASR 的音频刚好是「人说的那一段」。
-		if maxSamples := spokenMs * s.codec.samplesPerMs(); len(pcmAll) > maxSamples {
+		if maxSamples := spokenMs * s.inCodec.samplesPerMs(); len(pcmAll) > maxSamples {
 			pcmAll = pcmAll[:maxSamples]
 		}
 
@@ -421,13 +430,47 @@ func (s *session) appendMessage(m message) {
 	}
 }
 
-// speakSentence 播报一句话。
+// speakSentence 播报一句话：sentence_start → 音频帧 → sentence_end。
 //
-// 阶段 4 只下发文本；阶段 5 会在 sentence_start 和 sentence_end 之间
-// 插入这段文本合成的音频帧 —— 这也是设备和云端约定的格式。
+// 对应真实实现 tts.go 的 handleTextResponseWithHooks → handleTts →
+// runSenderLoop 那条链路。
+//
+// 真实实现的音频要经过好几级队列（ttsQueue → sessionAudioQueue → socket），
+// 由专门的发送循环按播放节奏控制发送速度；简化版直接同步写下去，
+// 顺序一样，只是没有「提前缓冲」的优化。
+//
+// 阶段 5 补上了中间那段音频 —— 这正是设备判断「一句话说完了没有」的依据：
+// 它收到 sentence_end 就知道这句的音频到齐了。
 func (s *session) speakSentence(ctx context.Context, sentence string) {
 	s.reply(ServerMessage{Type: SrvTts, State: StateSentenceStart, Text: sentence})
+
+	frames, err := s.tts.Synthesize(ctx, sentence)
+	if err != nil {
+		log.Printf("[%s] 语音合成失败（%s）: %v", s.deviceID, s.tts.Name(), err)
+		frames = nil
+	}
+	sent := 0
+	if frames != nil {
+		for frame := range frames {
+			if ctx.Err() != nil {
+				break
+			}
+			s.sendAudio(frame)
+			sent++
+		}
+	}
+
+	if sent == 0 {
+		log.Printf("[%s] 这一句没有产出音频: %q", s.deviceID, sentence)
+	}
 	s.reply(ServerMessage{Type: SrvTts, State: StateSentenceEnd, Text: sentence})
+}
+
+// sendAudio 把一个 Opus 帧写成 WebSocket 二进制帧。
+func (s *session) sendAudio(frame []byte) {
+	if err := s.conn.SendAudio(frame); err != nil {
+		log.Printf("[%s] 发送音频失败: %v", s.deviceID, err)
+	}
 }
 
 // reply 发送一条服务端消息，自动补上 session_id。

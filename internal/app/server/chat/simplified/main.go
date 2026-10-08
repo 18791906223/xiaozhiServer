@@ -24,6 +24,13 @@ func main() {
 	flag.StringVar(&appConfig.llmKey, "llm-key", "", "LLM 接口密钥")
 	flag.StringVar(&appConfig.llmModel, "llm-model", "gpt-4o-mini", "LLM 模型名")
 
+	flag.StringVar(&appConfig.ttsURL, "tts-url", "", "TTS 接口地址（OpenAI 兼容，留空则用内置模拟合成）")
+	flag.StringVar(&appConfig.ttsKey, "tts-key", "", "TTS 接口密钥")
+	flag.StringVar(&appConfig.ttsModel, "tts-model", "tts-1", "TTS 模型名")
+	flag.StringVar(&appConfig.ttsVoice, "tts-voice", "alloy", "TTS 音色")
+	flag.IntVar(&appConfig.ttsSourceRate, "tts-sample-rate", 24000,
+		"TTS 接口返回音频的采样率；与 16000 不一致会自动重采样")
+
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)

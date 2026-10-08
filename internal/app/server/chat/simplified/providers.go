@@ -11,6 +11,11 @@ type config struct {
 	asrURL, asrKey, asrModel           string
 	llmURL, llmKey, llmModel           string
 	ttsURL, ttsKey, ttsModel, ttsVoice string
+
+	// ttsSourceRate 是 TTS 接口返回音频的采样率。
+	// 它和 outAudioFormat.SampleRate 不一致时，服务端会做一次重采样
+	// （OpenAI 的 pcm 格式固定 24kHz，而设备要 16kHz）。
+	ttsSourceRate int
 }
 
 // appConfig 是全局配置。
