@@ -20,6 +20,10 @@ func main() {
 	flag.StringVar(&appConfig.asrKey, "asr-key", "", "ASR 接口密钥")
 	flag.StringVar(&appConfig.asrModel, "asr-model", "whisper-1", "ASR 模型名")
 
+	flag.StringVar(&appConfig.llmURL, "llm-url", "", "LLM 接口地址（OpenAI 兼容，留空则用内置模拟大模型）")
+	flag.StringVar(&appConfig.llmKey, "llm-key", "", "LLM 接口密钥")
+	flag.StringVar(&appConfig.llmModel, "llm-model", "gpt-4o-mini", "LLM 模型名")
+
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)

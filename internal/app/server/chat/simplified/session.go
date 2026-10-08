@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -30,6 +31,11 @@ type session struct {
 	// asr / llm / tts 是本轮对话流水线的三个环节，对应真实实现里的
 	// AsrProvider / LLMProvider / TTSProvider。
 	asr asrProvider
+	llm llmProvider
+
+	// history 是最近几轮对话，作为上下文一并发给 LLM。
+	// 真实实现还要做工具消息对齐、超长裁剪、长期记忆注入。
+	history []message
 
 	// opusQueue 对应真实实现 clientState.OpusAudioBuffer：
 	// 收帧循环只管往这里塞，音频处理循环慢慢消费，两边解耦。
@@ -59,6 +65,7 @@ func newSession(conn *transport, deviceID string) *session {
 		opusQueue: make(chan []byte, 100),
 		vad:       newVAD(),
 		asr:       appConfig.newASR(),
+		llm:       appConfig.newLLM(),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -314,12 +321,12 @@ func (s *session) handlePCM(pcm []float32) {
 	}
 }
 
-// recognize 把一整段语音变成文本，并下发给设备。
+// recognize 把一整段语音变成文本，然后交给大模型。
 //
 // 对应真实实现 asr.go 的识别循环 + chat.go 的 addAsrResultToQueue：
-// 识别结果先回一个 stt 消息（设备端可以显示字幕），然后进入 LLM 环节。
-// 真实实现把识别结果塞进 chatTextQueue 就返回，由另一个循环去请求 LLM；
-// 简化版直接在原地往下走（阶段 4 会接上 LLM）。
+// 识别结果先回一个 stt 消息（设备端可以显示字幕），再进入 LLM 环节。
+// 真实实现把结果塞进 chatTextQueue 就返回，由另一个循环去请求 LLM；
+// 简化版直接在原地往下走。
 func (s *session) recognize(pcm []float32) {
 	text, err := s.asr.Recognize(s.ctx, pcm)
 	if err != nil {
@@ -336,7 +343,91 @@ func (s *session) recognize(pcm []float32) {
 		Type: SrvStt,
 		Text: text,
 	})
-	// 阶段 4：这里接 LLM
+
+	s.replyWithLLM(s.ctx, text)
+}
+
+// replyWithLLM 把用户说的话交给大模型，并把回复按句下发给设备。
+//
+// 对应真实实现 llm.go 的 DoLLmRequest → handleLLMResponse →
+// ttsManager.handleTextResponseWithHooks 这一串。
+//
+// 消息顺序和设备看到的效果：
+//
+//	tts/start
+//	tts/sentence_start「第一句」 + 音频 + tts/sentence_end
+//	tts/sentence_start「第二句」 + 音频 + tts/sentence_end
+//	tts/stop
+func (s *session) replyWithLLM(ctx context.Context, userText string) {
+	messages := s.buildMessages(userText)
+
+	stream, err := s.llm.Chat(ctx, messages)
+	if err != nil {
+		log.Printf("[%s] 请求大模型失败（%s）: %v", s.deviceID, s.llm.Name(), err)
+		return
+	}
+
+	log.Printf("[%s] 开始播报（%s）", s.deviceID, s.llm.Name())
+	s.reply(ServerMessage{Type: SrvTts, State: StateStart})
+
+	splitter := &sentenceSplitter{}
+	var reply strings.Builder
+	for delta := range stream {
+		reply.WriteString(delta)
+		// 每收到一小段，就看有没有攒出完整的句子 —— 有就立刻合成、立刻下发。
+		// 这一步是「边说边播」的关键：不用等整段回复写完。
+		for _, sentence := range splitter.Push(delta) {
+			s.speakSentence(ctx, sentence)
+		}
+		if ctx.Err() != nil {
+			break // 被打断（阶段 6）
+		}
+	}
+	// 最后一句通常不带句末标点，别忘了。
+	if tail := splitter.Flush(); tail != "" && ctx.Err() == nil {
+		s.speakSentence(ctx, tail)
+	}
+
+	s.reply(ServerMessage{Type: SrvTts, State: StateStop})
+	s.appendMessage(message{Role: "assistant", Content: reply.String()})
+}
+
+// buildMessages 拼出发给 LLM 的消息列表：系统提示词 + 最近若干轮历史。
+//
+// 对应真实实现 llm.go 的 GetMessages：它会拼上角色设定、全局提示词、
+// 当前时间、长期记忆、声纹说话人、知识库路由策略……
+func (s *session) buildMessages(userText string) []message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.history = append(s.history, message{Role: "user", Content: userText})
+	if len(s.history) > maxHistoryMessages {
+		s.history = s.history[len(s.history)-maxHistoryMessages:]
+	}
+
+	messages := make([]message, 0, len(s.history)+1)
+	messages = append(messages, message{Role: "system", Content: systemPrompt})
+	return append(messages, s.history...)
+}
+
+// appendMessage 把助手回复追加进历史，并做条数裁剪。
+func (s *session) appendMessage(m message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.history = append(s.history, m)
+	if len(s.history) > maxHistoryMessages {
+		s.history = s.history[len(s.history)-maxHistoryMessages:]
+	}
+}
+
+// speakSentence 播报一句话。
+//
+// 阶段 4 只下发文本；阶段 5 会在 sentence_start 和 sentence_end 之间
+// 插入这段文本合成的音频帧 —— 这也是设备和云端约定的格式。
+func (s *session) speakSentence(ctx context.Context, sentence string) {
+	s.reply(ServerMessage{Type: SrvTts, State: StateSentenceStart, Text: sentence})
+	s.reply(ServerMessage{Type: SrvTts, State: StateSentenceEnd, Text: sentence})
 }
 
 // reply 发送一条服务端消息，自动补上 session_id。
