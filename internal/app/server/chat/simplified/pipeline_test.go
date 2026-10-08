@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -194,8 +197,8 @@ func TestStage2_SpeechEndTriggersRecognition(t *testing.T) {
 	dev.sendAudio(encodeOpus(t, silence(600)))
 
 	msg := dev.expectJSON(3*time.Second, SrvStt, "")
-	if !strings.Contains(msg.Text, "阶段2占位") {
-		t.Fatalf("期望拿到阶段 2 的占位识别结果，实际: %q", msg.Text)
+	if !strings.Contains(msg.Text, "模拟识别") {
+		t.Fatalf("期望拿到模拟识别的结果，实际: %q", msg.Text)
 	}
 	t.Logf("识别结果: %s", msg.Text)
 }
@@ -215,5 +218,94 @@ func TestStage2_ShortNoiseDoesNotTrigger(t *testing.T) {
 	_ = dev.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	if _, data, err := dev.conn.ReadMessage(); err == nil {
 		t.Fatalf("短促噪声不应触发识别，却收到了: %s", data)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 阶段 3：ASR
+// ---------------------------------------------------------------------------
+
+func TestStage3_WAVHeader(t *testing.T) {
+	pcm := tone(100, 440) // 100ms @16kHz 单声道 = 1600 个采样点
+	wav := pcmToWAV(pcm, 16000, 1)
+
+	if got := string(wav[0:4]); got != "RIFF" {
+		t.Fatalf("RIFF 标记不对: %q", got)
+	}
+	if got := string(wav[8:12]); got != "WAVE" {
+		t.Fatalf("WAVE 标记不对: %q", got)
+	}
+	if got := string(wav[36:40]); got != "data" {
+		t.Fatalf("data 标记不对: %q", got)
+	}
+	wantDataLen := uint32(len(pcm) * 2)
+	if got := binary.LittleEndian.Uint32(wav[40:44]); got != wantDataLen {
+		t.Fatalf("data 长度不对: got %d want %d", got, wantDataLen)
+	}
+	if len(wav) != 44+int(wantDataLen) {
+		t.Fatalf("WAV 总长不对: got %d want %d", len(wav), 44+wantDataLen)
+	}
+}
+
+func TestStage3_OpenAIASRRequestShape(t *testing.T) {
+	var (
+		gotPath  string
+		gotAuth  string
+		gotModel string
+		gotFile  []byte
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("解析 multipart 失败: %v", err)
+			return
+		}
+		gotModel = r.FormValue("model")
+		f, _, err := r.FormFile("file")
+		if err != nil {
+			t.Errorf("取 file 字段失败: %v", err)
+			return
+		}
+		defer f.Close()
+		gotFile, _ = io.ReadAll(f)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"text":"你好世界"}`)
+	}))
+	defer ts.Close()
+
+	a := newOpenAIASR(ts.URL, "test-key", "whisper-1")
+	text, err := a.Recognize(context.Background(), tone(500, 440))
+	if err != nil {
+		t.Fatalf("识别失败: %v", err)
+	}
+	if text != "你好世界" {
+		t.Fatalf("识别结果不对: %q", text)
+	}
+	if gotPath != "/audio/transcriptions" {
+		t.Fatalf("请求路径不对: %s", gotPath)
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Fatalf("Authorization 不对: %s", gotAuth)
+	}
+	if gotModel != "whisper-1" {
+		t.Fatalf("model 字段不对: %s", gotModel)
+	}
+	if len(gotFile) < 44 || string(gotFile[0:4]) != "RIFF" {
+		t.Fatalf("上传的不是合法 WAV，长度 %d", len(gotFile))
+	}
+}
+
+func TestStage3_MockASRErrorPropagation(t *testing.T) {
+	// 服务端返回 500 时，错误要能带出来（而不是静默返回空文本）
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"boom"}`)
+	}))
+	defer ts.Close()
+
+	a := newOpenAIASR(ts.URL, "k", "m")
+	if _, err := a.Recognize(context.Background(), tone(100, 440)); err == nil {
+		t.Fatal("期望返回错误，实际为 nil")
 	}
 }

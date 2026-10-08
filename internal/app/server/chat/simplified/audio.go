@@ -61,3 +61,16 @@ func (c *codec) decode(frame []byte) ([]float32, error) {
 	}
 	return buf[:n], nil
 }
+
+// floatToInt16 把 [-1,1] 的浮点采样转成 16bit 整型。
+// ASR 需要的 WAV、Opus 编码器需要的输入，都是这个格式。
+func floatToInt16(s float32) int16 {
+	switch {
+	case s >= 1:
+		return 32767
+	case s <= -1:
+		return -32768
+	default:
+		return int16(s * 32767)
+	}
+}

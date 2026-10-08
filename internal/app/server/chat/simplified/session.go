@@ -27,6 +27,10 @@ type session struct {
 
 	codec *codec // Opus 编解码，hello 拿到音频格式后创建
 
+	// asr / llm / tts 是本轮对话流水线的三个环节，对应真实实现里的
+	// AsrProvider / LLMProvider / TTSProvider。
+	asr asrProvider
+
 	// opusQueue 对应真实实现 clientState.OpusAudioBuffer：
 	// 收帧循环只管往这里塞，音频处理循环慢慢消费，两边解耦。
 	opusQueue chan []byte
@@ -54,6 +58,7 @@ func newSession(conn *transport, deviceID string) *session {
 		outFormat: outAudioFormat,
 		opusQueue: make(chan []byte, 100),
 		vad:       newVAD(),
+		asr:       appConfig.newASR(),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -309,19 +314,29 @@ func (s *session) handlePCM(pcm []float32) {
 	}
 }
 
-// recognize 把一整段语音变成文本。
+// recognize 把一整段语音变成文本，并下发给设备。
 //
-// 阶段 2 先用一个占位实现，让你能立刻看到「VAD 切出了一句话」这件事；
-// 阶段 3 会把它换成真正的 ASR。
+// 对应真实实现 asr.go 的识别循环 + chat.go 的 addAsrResultToQueue：
+// 识别结果先回一个 stt 消息（设备端可以显示字幕），然后进入 LLM 环节。
+// 真实实现把识别结果塞进 chatTextQueue 就返回，由另一个循环去请求 LLM；
+// 简化版直接在原地往下走（阶段 4 会接上 LLM）。
 func (s *session) recognize(pcm []float32) {
-	ms := len(pcm) / s.codec.samplesPerMs()
-	text := fmt.Sprintf("[阶段2占位] 我听到了约 %d 毫秒的语音", ms)
-	log.Printf("[%s] ASR（占位）→ %s", s.deviceID, text)
+	text, err := s.asr.Recognize(s.ctx, pcm)
+	if err != nil {
+		log.Printf("[%s] 识别失败（%s）: %v", s.deviceID, s.asr.Name(), err)
+		return
+	}
+	if text == "" {
+		log.Printf("[%s] 识别结果为空，本轮结束", s.deviceID)
+		return
+	}
 
+	log.Printf("[%s] 识别结果（%s）→ %s", s.deviceID, s.asr.Name(), text)
 	s.reply(ServerMessage{
 		Type: SrvStt,
 		Text: text,
 	})
+	// 阶段 4：这里接 LLM
 }
 
 // reply 发送一条服务端消息，自动补上 session_id。
