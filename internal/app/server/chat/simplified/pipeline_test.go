@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"gopkg.in/hraban/opus.v2"
 )
 
 // 本文件用一个「进程内的假设备」来验证整条链路。
@@ -74,6 +76,53 @@ func (d *device) sendJSON(msg ClientMessage) {
 	}
 }
 
+// sendAudio 发送若干 Opus 音频帧（模拟设备端上行）。
+func (d *device) sendAudio(frames [][]byte) {
+	d.t.Helper()
+	for _, f := range frames {
+		if err := d.conn.WriteMessage(websocket.BinaryMessage, f); err != nil {
+			d.t.Fatalf("发送音频失败: %v", err)
+		}
+	}
+}
+
+// encodeOpus 把 PCM 按 60ms 一帧编成 Opus。
+// 这是测试在扮演「设备端」的编码工作 —— 服务端只负责解码。
+func encodeOpus(t *testing.T, pcm []float32) [][]byte {
+	t.Helper()
+	enc, err := opus.NewEncoder(inAudioFormat.SampleRate, inAudioFormat.Channels, opus.AppAudio)
+	if err != nil {
+		t.Fatalf("创建编码器失败: %v", err)
+	}
+	frameSamples := inAudioFormat.SampleRate * inAudioFormat.FrameDuration / 1000
+
+	var frames [][]byte
+	buf := make([]byte, 4000)
+	for i := 0; i+frameSamples <= len(pcm); i += frameSamples {
+		n, err := enc.EncodeFloat32(pcm[i:i+frameSamples], buf)
+		if err != nil {
+			t.Fatalf("编码失败: %v", err)
+		}
+		frames = append(frames, append([]byte(nil), buf[:n]...))
+	}
+	return frames
+}
+
+// tone 生成一段正弦波，振幅 0.5 —— 远高于 VAD 阈值，模拟人声。
+func tone(ms int, freq float64) []float32 {
+	n := inAudioFormat.SampleRate * ms / 1000
+	out := make([]float32, n)
+	for i := range out {
+		out[i] = 0.5 * float32(math.Sin(2*math.Pi*freq*float64(i)/float64(inAudioFormat.SampleRate)))
+	}
+	return out
+}
+
+// silence 生成一段静音。
+func silence(ms int) []float32 {
+	return make([]float32, inAudioFormat.SampleRate*ms/1000)
+}
+
 // readJSON 在超时内读一条 JSON 消息。
 func (d *device) readJSON(wait time.Duration) ServerMessage {
 	d.t.Helper()
@@ -126,4 +175,45 @@ func TestStage1_Handshake(t *testing.T) {
 	dev.listen(StateStart)
 	dev.listen(StateStop)
 	time.Sleep(100 * time.Millisecond)
+}
+
+// ---------------------------------------------------------------------------
+// 阶段 2：Opus 解码 + VAD 断句
+// ---------------------------------------------------------------------------
+
+func TestStage2_SpeechEndTriggersRecognition(t *testing.T) {
+	url := startTestServer(t)
+	dev := dialDevice(t, url, "test-device-vad")
+	dev.hello()
+	dev.expectJSON(3*time.Second, SrvHello, "")
+
+	dev.listen(StateStart)
+	// 说 1 秒（模拟人声的 440Hz 正弦波）
+	dev.sendAudio(encodeOpus(t, tone(1000, 440)))
+	// 再静音 600ms —— 超过 400ms 的静音阈值，VAD 应判定「说完了」
+	dev.sendAudio(encodeOpus(t, silence(600)))
+
+	msg := dev.expectJSON(3*time.Second, SrvStt, "")
+	if !strings.Contains(msg.Text, "阶段2占位") {
+		t.Fatalf("期望拿到阶段 2 的占位识别结果，实际: %q", msg.Text)
+	}
+	t.Logf("识别结果: %s", msg.Text)
+}
+
+func TestStage2_ShortNoiseDoesNotTrigger(t *testing.T) {
+	url := startTestServer(t)
+	dev := dialDevice(t, url, "test-device-noise")
+	dev.hello()
+	dev.expectJSON(3*time.Second, SrvHello, "")
+
+	dev.listen(StateStart)
+	// 只响 100ms —— 短于 minSpeech(200ms)，应被当作噪声丢掉
+	dev.sendAudio(encodeOpus(t, tone(100, 440)))
+	dev.sendAudio(encodeOpus(t, silence(600)))
+
+	// 不该收到 stt；用一个很短的超时确认「什么都没有」
+	_ = dev.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, data, err := dev.conn.ReadMessage(); err == nil {
+		t.Fatalf("短促噪声不应触发识别，却收到了: %s", data)
+	}
 }
