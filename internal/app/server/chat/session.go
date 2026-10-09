@@ -1,3 +1,24 @@
+// session.go 是 chat 包的「会话层」，实现 ChatSession。
+//
+// 职责：
+//   - 承载一次对话从「开始听话」到「回复播完」的完整链路：listen 处理、VAD/ASR 启动、
+//     ASR 文本入队、OpenClaw 路由、打断、结束清理；
+//   - 持有并协调三个子管理器：ASRManager（音频→文本）、LLMManager（文本→文本/工具）、
+//     TTSManager（文本→音频帧），以及声纹识别 SpeakerManager 与媒体播放器 SessionMediaPlayer；
+//   - 管理会话级上下文的「代际」（listenStartSeq）与静默/保留态。
+//
+// 在整体流程中的位置：
+//
+//	chat.go（握手/消息分发）→ 本文件（会话内流程编排）→ asr.go / llm.go / tts.go（各链路实现）
+//
+// 与哪些文件配合：
+//   - chat.go：ChatSession 由 ChatManager 惰性创建与持有，关闭时通过 closeHandler 回调通知；
+//   - common.go：stopSpeaking 系列与 ResetToSilentState 的具体实现在那里；
+//   - asr.go / llm.go / tts.go：本文件只做编排与状态判断，具体链路逻辑在各自文件里；
+//   - media_player.go / openclaw_warmup.go：媒体播放与 OpenClaw 暖场话术。
+//
+// 生命周期：一次 listen start 触发一轮「听→答」，而会话本身可跨多轮复用；
+// 设备 goodbye 后会话不销毁，而是被重置为静默态并进入保留期（见 chat.go 的 scheduleRetainedSessionCleanup）。
 package chat
 
 import (
@@ -33,35 +54,63 @@ import (
 	log "xiaozhi-esp32-server-golang/logger"
 )
 
+// AsrResponseChannelItem 是 chatTextQueue（ASR→LLM 的交接队列）里的元素。
+//
+// 为什么要连 ctx 一起带上：排队意味着可能等一会儿才被处理，而等待期间「本轮对话」
+// 可能已被打断/重置（ctx 被 cancel）。把当时的 ctx 随元素保存，处理时就能通过
+// ctx.Done() 判断这条消息是否已经过期，从而丢弃而不是「用旧上下文说新话」。
 type AsrResponseChannelItem struct {
 	ctx           context.Context
 	text          string
 	speakerResult *speaker.IdentifyResult
 }
 
+// detectLLMDebounceDuration listen detect 到真正送入 LLM 之间的缓冲时长。
+// 为什么需要：detect 常是「设备刚听到一点前导语音」的信号，紧接着通常会收到正式的
+// listen start。用很短的窗口等一等，让正式监听有机会接管，避免同一句话既被 detect 触发、
+// 又被正式 ASR 识别，导致重复回复。
 const detectLLMDebounceDuration = 300 * time.Millisecond
 
+// detectAction 是 listen detect 文本被判定后要执行的动作。
 type detectAction string
 
 const (
-	detectActionSilent  detectAction = "silent"
+	// detectActionSilent 忽略这段文本（例如重复唤醒词、空文本）。
+	detectActionSilent detectAction = "silent"
+	// detectActionWelcome 播放欢迎语（首次唤醒）。
 	detectActionWelcome detectAction = "welcome"
-	detectActionLLM     detectAction = "llm"
+	// detectActionLLM 按普通文本交给 LLM 处理。
+	detectActionLLM detectAction = "llm"
 )
 
+// welcomePlaybackResult 表示一次欢迎语播放等待的结局。
+// natural=true 表示欢迎语完整播完；false 表示被打断/取消。
+// realtime 场景据此决定是否继续进入 listen（见 waitForWelcomePlaybackCompletion）。
 type welcomePlaybackResult struct {
 	natural bool
 }
 
+// ChatSession 关闭原因常量。它们不只是日志文案，还决定了后续动作：
+// 例如 chat.go 的 shouldSendMqttGoodbyeOnSessionClose 只对其中一部分发送 mqtt goodbye。
 const (
-	chatSessionCloseReasonManagerShutdown     = "manager_shutdown"
-	chatSessionCloseReasonExplicitExit        = "explicit_exit"
-	chatSessionCloseReasonFatalError          = "fatal_error"
-	chatSessionCloseReasonAudioIdleTimeout    = "audio_idle_timeout"
+	// chatSessionCloseReasonManagerShutdown ChatManager 整体关闭（连接要断了）。
+	chatSessionCloseReasonManagerShutdown = "manager_shutdown"
+	// chatSessionCloseReasonExplicitExit 明确退出对话（用户退出词、上层要求退出）。
+	chatSessionCloseReasonExplicitExit = "explicit_exit"
+	// chatSessionCloseReasonFatalError 不可恢复错误（ASR/链路异常），需要断开会话。
+	chatSessionCloseReasonFatalError = "fatal_error"
+	// chatSessionCloseReasonAudioIdleTimeout 长时间既无语音也无识别结果，主动回收。
+	chatSessionCloseReasonAudioIdleTimeout = "audio_idle_timeout"
+	// chatSessionCloseReasonRetainedIdleTimeout 保留态超时（纯服务端空闲回收，设备无关）。
 	chatSessionCloseReasonRetainedIdleTimeout = "retained_idle_timeout"
 )
 
+// ChatSession 是一次「对话会话」：把 ASR / LLM / TTS / 声纹 / 媒体播放串成一条完整链路。
+//
+// 与 ChatManager 的关系：ChatManager 管「连接」，ChatSession 管「对话」。
+// 一条连接上同一时刻最多一个会话，但会话可以跨多轮复用。
 type ChatSession struct {
+	// 五个子管理器/依赖，各自拥有独立 goroutine，本结构负责编排它们。
 	clientState     *ClientState
 	asrManager      *ASRManager
 	ttsManager      *TTSManager
@@ -70,56 +119,94 @@ type ChatSession struct {
 	mediaPlayer     *SessionMediaPlayer
 	serverTransport *ServerTransport
 
+	// ctx 是会话级根上下文：会话内所有后台 goroutine（VAD 循环、文本队列、
+	// LLM/TTS 队列处理等）都挂在它下面；cancel 在 CloseWithReason 时调用。
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// chatTextQueue 是「ASR 结果 → LLM」的交接队列（容量 10）。
+	// 用队列而不是直接调用：ASR 循环不应被 LLM 的耗时阻塞，两者通过队列解耦。
 	chatTextQueue *util.Queue[AsrResponseChannelItem]
 
 	// 声纹识别结果暂存（带锁保护）
+	//
+	// 为什么需要暂存 + 通知：声纹识别是「静音后才开始算」的异步操作（见构造函数中
+	// OnVoiceSilenceSpeakerCallback 的回调），而 ASR 最终文本可能先一步到达。
+	// 因此这里采用「结果寄存 + 就绪信号」的方式让两条异步链路汇合（见 getSpeakerResult）。
 	speakerResultMu        sync.RWMutex
 	pendingSpeakerResult   *speaker.IdentifyResult
 	speakerResultReady     chan struct{} // 仅用于通知就绪，不传数据
-	turnSpeakerInterrupted atomic.Bool
+	turnSpeakerInterrupted atomic.Bool   // 本轮是否因声纹相关原因被打断（影响是否允许该说话人继续对话）
 
-	vadLoopStarted              bool
-	listenStartSeq              atomic.Uint64
+	// vadLoopStarted 保证 VAD 常驻循环只启动一次（会话可跨多轮复用，Start 可能被多次调用语义覆盖）。
+	vadLoopStarted bool
+	// listenStartSeq 是「listen start 代际号」。每次 listen start 自增，
+	// 异步的启动流程会沿途校验自己是否仍是当前代际；不是则丢弃结果（见 OnListenStart）。
+	// 这样连点/重复的 listen start 不会让旧的启动流程干扰新的。
+	listenStartSeq atomic.Uint64
+	// realtimeListenSessionActive 标记 realtime 下是否已有一次监听会话在进行，
+	// 用于忽略重复的 listen start（realtime 是长驻监听，重复包没有意义）。
 	realtimeListenSessionActive atomic.Bool
 
 	// 未激活设备高频触发时，短时间内复用最近一次“未激活”判定，避免频繁打接口。
+	// 设备未激活时会不断重发 listen，如果每次都查一次激活状态接口会造成无谓压力。
 	activationCheckMu     sync.Mutex
 	lastActivationFalseAt time.Time
 
 	// Close 保护，防止多次关闭
 	closeOnce sync.Once
-	closing   atomic.Bool
+	// closing 表示会话正在（或已经）关闭。用 atomic 让任意 goroutine 都能无锁判断。
+	closing atomic.Bool
 
 	// stopSpeaking 保护，防止与 AddAsrResultToQueue/HandleWelcome 并发冲突
+	//
+	// 这把锁的意义：StopSpeaking（打断）与「往文本队列塞新消息」如果交错执行，
+	// 可能出现「刚清空队列又被塞进一条」的竞态，于是用同一把锁把两者串起来。
+	// AddAsrResultToQueue 还会用 TryLock 来「探测」打断是否正在进行（见该方法）。
 	stopSpeakingMu sync.Mutex
 
+	// welcomePlaybackMu 保护 welcomePlaybackDoneCh：欢迎语播放等待通道。
+	// 生成新通道时旧通道会被以 natural=false 收尾，保证等待方不会永久阻塞。
 	welcomePlaybackMu     sync.Mutex
 	welcomePlaybackDoneCh chan welcomePlaybackResult
 
+	// detectLLMDebounceMu 保护 detectLLMDebounceTimer，避免并发重排导致定时器泄漏。
 	detectLLMDebounceMu    sync.Mutex
 	detectLLMDebounceTimer *time.Timer
 
+	// openClawStreamMu 保护 openClawStreams：OpenClaw 流式回复的「correlation_id → 通道」映射。
 	openClawStreamMu sync.Mutex
 	openClawStreams  map[string]chan llm_common.LLMResponseStruct
 
+	// openClawWarmupMu 保护 openClawWarmup：等待 OpenClaw 回复期间的暖场话术任务。
 	openClawWarmupMu sync.Mutex
 	openClawWarmup   *openClawWarmupTask
 
-	hookHub      *chathooks.Hub
+	// hookHub 事件钩子中心（与 ChatManager 共用同一实例）。
+	hookHub *chathooks.Hub
+	// closeHandler 会话关闭后的回调，由 ChatManager 注册（见 WithChatSessionCloseHandler），
+	// 用于让 ChatManager 摘除会话、决定要不要发 goodbye 等。
 	closeHandler func(session *ChatSession, reason string)
 }
 
+// ChatSessionOption 新建 ChatSession 时的可选配置（函数式选项）。
 type ChatSessionOption func(*ChatSession)
 
+// WithChatSessionCloseHandler 注册会话关闭回调。
+// 由 ChatManager 使用，让会话关闭时能通知到「连接层」做后续处理。
 func WithChatSessionCloseHandler(handler func(session *ChatSession, reason string)) ChatSessionOption {
 	return func(s *ChatSession) {
 		s.closeHandler = handler
 	}
 }
 
+// NewChatSession 构造一个会话。只是「组装对象」，不做任何耗时初始化：
+// 真正启动 ASR/LLM/TTS 与后台循环的是 Start，这样构造过程不会阻塞调用方（例如 hello 处理）。
+//
+// 这里的两个「回调注入」是 chat 包与 data 层解耦的关键：
+// ClientState 位于 internal/data/client，不能反向依赖 chat 包，因此它只声明
+// 「OnVoiceSilenceMetricCallback / OnAsrFirstTextCallback / OnVoiceSilenceSpeakerCallback」
+// 这类函数字段；本构造函数把会话里的具体实现塞进去，形成从底层往上调用的钩子。
 func NewChatSession(clientState *ClientState, serverTransport *ServerTransport, hookHub *chathooks.Hub, transformRegistry *streamtransform.Registry, opts ...ChatSessionOption) *ChatSession {
 	s := &ChatSession{
 		clientState:        clientState,
@@ -134,11 +221,13 @@ func NewChatSession(clientState *ClientState, serverTransport *ServerTransport, 
 	}
 
 	s.asrManager = NewASRManager(clientState, serverTransport)
+	// 让 ASR 侧能回调会话（异常处理、打断判定等），同时保持 data 层不反向依赖 chat 包。
 	s.asrManager.session = s // 设置 session 引用
 	s.ttsManager = NewTTSManager(clientState, serverTransport, s)
 	s.mediaPlayer = NewSessionMediaPlayer(s)
 	s.llmManager = NewLLMManager(clientState, serverTransport, s.ttsManager, s, transformRegistry)
 
+	// 把「静音」指标埋点桥接到会话的 Trace 方法（VAD 判定语音结束时上报一次）。
 	clientState.OnVoiceSilenceMetricCallback = func(ctx context.Context, ts int64) {
 		s.TraceVoiceSilence(ctx, ts)
 	}
@@ -167,6 +256,14 @@ func NewChatSession(clientState *ClientState, serverTransport *ServerTransport, 
 				log.Debugf("设备 %s 启用声纹识别", clientState.DeviceID)
 
 				// 设置异步获取声纹结果的回调
+				// 触发时机：VAD 判定「本轮说话结束」时
+				// （见 client.ClientState.OnVoiceSilence，那里在收口 ASR 的同时触发它）。
+				//
+				// 为什么要异步、为什么只存不发：
+				//   - 声纹识别要拿本轮音频去算，耗时不可控，若同步等待会拖慢 ASR 收口；
+				//   - 而 ASR 最终文本何时到达同样不确定。两者是两条独立的异步链，
+				//     因此这里只把结果「寄存」到 pendingSpeakerResult，并关闭 speakerResultReady
+				//     作就绪信号，由 ASR 侧在需要时来取（getSpeakerResult 会短暂等待）。
 				clientState.OnVoiceSilenceSpeakerCallback = func(ctx context.Context) {
 					log.Debugf("[声纹识别] OnVoiceSilenceSpeakerCallback 被调用, deviceID: %s", clientState.DeviceID)
 
@@ -179,6 +276,8 @@ func NewChatSession(clientState *ClientState, serverTransport *ServerTransport, 
 							//log.Warnf("[声纹识别] speakerManager 未激活，无法获取识别结果")
 							return
 						}
+						// 先清空上一轮可能残留的结果与就绪信号：声纹是「按轮」的概念，
+						// 若不清，ASR 侧可能取到上一轮说话人的结果，导致音色/权限判断错人。
 						// 清空之前的结果
 						s.speakerResultMu.Lock()
 						oldResult := s.pendingSpeakerResult
@@ -241,6 +340,15 @@ func NewChatSession(clientState *ClientState, serverTransport *ServerTransport, 
 	}
 
 	// 设置 ASR 首次返回字符的回调
+	// 触发时机：ASR 侧拿到第一个非空文本时。
+	// 这里的每一步都有明确目的，改动时不要随意删：
+	//   - MarkTextReceived：告诉 ASR 循环「本轮有文本了」，用于空结果保护
+	//     （避免上游异常时把「一直没结果」误判成需要断连）；
+	//   - ClearAudioIdleTimeoutPending / PauseAudioIdleWindow：用户已经在说话了，
+	//     必须暂停「长时间无语音就回收会话」的空闲计时，否则会把正常对话误杀；
+	//   - MarkAsrFirstText / TraceAsrFirstText：埋点，用于统计首字延迟；
+	//   - realtime_mode=4：realtime 模式下「ASR 首字」就打断当前播报（最低延迟的 barge-in）。
+	//     但若此时正在播 MCP 媒体（realtime 媒体门控激活），则不能打断——否则音乐会被语音误停。
 	clientState.OnAsrFirstTextCallback = func(text string, isFinal bool) {
 		clientState.Asr.MarkTextReceived()
 		clientState.ClearAudioIdleTimeoutPending()
@@ -260,6 +368,17 @@ func NewChatSession(clientState *ClientState, serverTransport *ServerTransport, 
 	return s
 }
 
+// Start 启动会话：先补上音频格式前置校验，再初始化资源并起一批后台循环。
+//
+// 前置校验「输入音频格式未初始化」是必要的一道闸：输入格式来自 hello，
+// 若没有它，VAD/ASR 无法正确解码音频（会静默地产生垃圾识别结果）。
+//
+// 三个循环/启动项各自的理由：
+//   - runAudioIdleTimeoutWatchdog：会话级空闲看门狗，必须独立于单次 ASR 循环存在，
+//     这样 auto 模式在一轮成功结束后仍能继续统计「连接空闲了多久」；
+//   - processChatText：消费 chatTextQueue，把 ASR 文本送进 LLM（本文件的 actionDoChat）；
+//   - llmManager.Start / ttsManager.Start：消费 LLM 响应队列与 TTS 句子队列；
+//   - initHistoryMessages 放异步：加载历史（可能走 Redis/Manager 网络请求）不该拖慢会话启动。
 func (s *ChatSession) Start(pctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(pctx)
 
@@ -285,10 +404,15 @@ func (s *ChatSession) Start(pctx context.Context) error {
 		// Session 级 idle watchdog 需要独立于单次 ASR loop 生命周期存在，
 		// 这样 auto 模式在一轮成功结束后仍能继续统计连接空闲时间。
 		go s.asrManager.runAudioIdleTimeoutWatchdog(s.ctx)
+		// [1.1] VAD 识别循环：消费 OpusAudioBuffer → 解码 PCM → VAD 检测 → 喂给 ASR
 		s.asrManager.ProcessVadAudio(s.ctx)
 		s.vadLoopStarted = true
 	}
 
+	// 三条常驻消费循环在此启动，串起「中段 + 下行」：
+	//   [3.0] 消费 chatTextQueue（ASR 文本 → LLM 路由）
+	//   [3.4] 消费 llmResponseQueue（LLM 响应 → TTS / 工具）
+	//   [5.1] 消费 ttsQueue（文本 → 音频帧 → 发送队列）
 	go s.processChatText(s.ctx)  //处理 asr后 的对话消息
 	go s.llmManager.Start(s.ctx) //处理 llm后 的一系列返回消息
 	go s.ttsManager.Start(s.ctx) //处理 tts的 消息队列
@@ -300,6 +424,13 @@ func (s *ChatSession) Start(pctx context.Context) error {
 }
 
 // 初始化历史对话记录到内存中
+//
+// 为什么要异步加载：历史可能来自 Redis 或远程 Manager，是网络请求，放到会话启动路径上
+// 会直接增加首轮响应延迟，因此 Start 里用 goroutine 调用它。
+//
+// 数据源由 config_provider.type 决定（redis / manager），两者不是优先级关系而是二选一；
+// memory 模式为 none 时直接跳过（省掉无意义的请求）。加载到的消息写入 ClientState 的内存
+// Dialogue，后续 LLM 组 prompt 时会用到（见 llm.go）。
 func (s *ChatSession) initHistoryMessages() error {
 	var historyMessages []*schema.Message
 	var err error
@@ -357,6 +488,7 @@ func (s *ChatSession) initHistoryMessages() error {
 }
 
 // shouldUseRedis 判断是否使用 Redis 作为数据源
+// shouldUseRedis 判断是否从 Redis 取历史消息（依据 config_provider.type）。
 func (s *ChatSession) shouldUseRedis() bool {
 	// 根据 config_provider.type 判断
 	providerType := viper.GetString("config_provider.type")
@@ -364,6 +496,7 @@ func (s *ChatSession) shouldUseRedis() bool {
 }
 
 // shouldUseManager 判断是否使用 Manager 作为数据源
+// shouldUseManager 判断是否从远程 Manager 取历史消息（依据 config_provider.type）。
 func (s *ChatSession) shouldUseManager() bool {
 	// 根据 config_provider.type 判断
 	providerType := viper.GetString("config_provider.type")
@@ -371,6 +504,10 @@ func (s *ChatSession) shouldUseManager() bool {
 }
 
 // loadFromManager 从 Manager 数据库加载历史消息
+// loadFromManager 从远程 Manager 的 HTTP 接口拉取最近 20 条历史消息，
+// 并转换成 Eino 的 schema.Message 供 LLM 使用。
+// 这里逐条 switch role 是为了保证转换出的消息类型正确（user/assistant/tool/system），
+// 未知角色直接跳过并告警，避免把脏数据塞进 prompt 造成模型行为异常。
 func (s *ChatSession) loadFromManager() ([]*schema.Message, error) {
 	// 创建 HistoryClient
 	historyCfg := history.HistoryClientConfig{
@@ -426,6 +563,12 @@ func (s *ChatSession) loadFromManager() ([]*schema.Message, error) {
 }
 
 // 在mqtt 收到type: listen, state: start后进行
+//
+// InitAsrLlmTts 初始化会话所需的 ASR 结构与记忆（memory）提供者。
+//
+// 为什么 memory 在这里初始化而不是随连接创建：记忆是按「会话」使用的（要取 memory context
+// 注入 prompt），且只有长记忆模式才需要真正建 provider 与加载上下文，
+// 非长记忆模式统一降级为 none，避免为不需要的设备付出代价。
 func (c *ChatSession) InitAsrLlmTts() error {
 	//初始化asr结构
 	c.clientState.InitAsr()
@@ -458,7 +601,14 @@ func (c *ChatSession) InitAsrLlmTts() error {
 	return nil
 }
 
+// [1.0] 读取音频（入缓冲）：把 Opus 帧塞进 OpusAudioBuffer，等 VAD 循环消费。
+//
 // HandleAudioMessage 处理音频消息
+// 把一帧上行 Opus 音频放进接收缓冲，满了就丢弃并返回 false。
+//
+// 为什么用「非阻塞发送 + 丢弃」而不是阻塞等待：调用方是 ChatManager 的收包协程，
+// 一旦阻塞，后续的控制消息（打断、goodbye）都会延迟处理，问题比丢一帧音频严重得多。
+// 音频是可丢的实时数据，丢旧帧好过让整条链路卡住。
 func (c *ChatSession) HandleAudioMessage(data []byte) bool {
 	select {
 	case c.clientState.OpusAudioBuffer <- data:
@@ -470,6 +620,10 @@ func (c *ChatSession) HandleAudioMessage(data []byte) bool {
 }
 
 // handleListenMessage 处理监听消息
+// 按 listen 消息的 state 分发到 start / stop / detect 三个处理分支。
+//
+// 三个 state 语义不同：start=开始拾音、stop=结束拾音（我方收口）、detect=设备检测到
+// 一段可能的前导文本（不等于正式拾音）。因此后面的处理路径也完全不同。
 func (s *ChatSession) HandleListenMessage(msg *ClientMessage) error {
 	// 根据状态处理
 	switch msg.State {
@@ -486,6 +640,12 @@ func (s *ChatSession) HandleListenMessage(msg *ClientMessage) error {
 	return nil
 }
 
+// beginListenStart 开启一次新的 listen 起点：递增代际号、把相位置为 starting，
+// 并返回本次的代际号供异步启动流程沿途校验。
+//
+// 代际号（listenStartSeq）解决的竞态：listen start 是异步处理的（要在 goroutine 里做
+// 资源初始化），期间可能又来了新的 listen start 或打断，旧流程若不管不顾地继续，
+// 就会把相位/ASR 状态改回旧的样子。因此约定「只有代际号仍等于当前值时才允许推进」。
 func (s *ChatSession) beginListenStart() uint64 {
 	startSeq := s.listenStartSeq.Add(1)
 	if s.clientState.IsRealTime() {
@@ -495,20 +655,34 @@ func (s *ChatSession) beginListenStart() uint64 {
 	return startSeq
 }
 
+// invalidateListenStart 使当前 listen 会话失效（listen stop 或打断时调用）：
+// 递增代际号让在途的异步启动全部作废，取消 realtime 监听标记，并把相位复位为 idle。
 func (s *ChatSession) invalidateListenStart() {
 	s.listenStartSeq.Add(1)
 	s.realtimeListenSessionActive.Store(false)
 	s.clientState.SetListenPhase(ListenPhaseIdle)
 }
 
+// isCurrentListenStart 判断给定代际号是否仍是当前代际，即「这次启动还没被作废」。
 func (s *ChatSession) isCurrentListenStart(startSeq uint64) bool {
 	return startSeq == s.listenStartSeq.Load()
 }
 
+// isRealtimeListenSessionActive 查询 realtime 监听会话是否已在进行中。
+// 用于忽略重复的 realtime listen start（realtime 是长驻监听，重复包只会造成干扰）。
 func (s *ChatSession) isRealtimeListenSessionActive() bool {
 	return s.realtimeListenSessionActive.Load()
 }
 
+// shouldIgnoreListenStartError 判断 listen start 启动过程中的错误是否属于「正常中断、可忽略」。
+//
+// 三种情况都不是真故障，而是「这轮启动已经被放弃」的正常表现：
+//   - 代际已过期（又来了一次 listen start 或被打断）；
+//   - 传入的 ctx 已被取消；
+//   - 客户端状态 ctx 已取消（链路/会话在收尾）；
+//   - 错误本身是 context.Canceled。
+//
+// 若不区分，就会把用户打断导致的取消当成致命错误，误关会话（进而影响下次唤醒的复用）。
 func (s *ChatSession) shouldIgnoreListenStartError(startSeq uint64, ctx context.Context, err error) bool {
 	if !s.isCurrentListenStart(startSeq) {
 		return true
@@ -522,6 +696,9 @@ func (s *ChatSession) shouldIgnoreListenStartError(startSeq uint64, ctx context.
 	return errors.Is(err, context.Canceled)
 }
 
+// shouldIgnoreAsrLoopError 与 shouldIgnoreListenStartError 同理，
+// 用于判断 ASR 识别循环的退出错误是否只是「本轮被重置/退出」而非真故障。
+// 二者判断条件相同但职责不同（一个管启动、一个管循环），故分开保留以便日后独立调整。
 func (s *ChatSession) shouldIgnoreAsrLoopError(startSeq uint64, ctx context.Context, err error) bool {
 	if !s.isCurrentListenStart(startSeq) {
 		return true
@@ -535,6 +712,8 @@ func (s *ChatSession) shouldIgnoreAsrLoopError(startSeq uint64, ctx context.Cont
 	return errors.Is(err, context.Canceled)
 }
 
+// isAutoListenActive 判断 auto 模式下的自动监听是否正在进行
+// （相位为 starting 或 listening）。用户已唤醒并处于拾音中时，重复的唤醒词就该被忽略。
 func isAutoListenActive(state *ClientState) bool {
 	if state == nil || state.ListenMode != "auto" {
 		return false
@@ -543,14 +722,25 @@ func isAutoListenActive(state *ClientState) bool {
 	return phase == ListenPhaseStarting || phase == ListenPhaseListening
 }
 
+// shouldIgnoreListenStartDuringWelcome 判断是否应忽略这条 listen start：
+// auto/manual 模式下，欢迎语还在播时设备常会自动补发 listen start，
+// 这条包不应抢占欢迎语，因此直接忽略。（realtime 走的是「等待欢迎语结束」而非忽略。）
 func shouldIgnoreListenStartDuringWelcome(mode string, welcomePlaying bool) bool {
 	return mode != "realtime" && welcomePlaying
 }
 
+// shouldWaitRealtimeListenStartDuringWelcome 目前恒为 false，
+// 即「realtime 首次 listen start 时等待欢迎语播完」这条路径被显式关闭（保留判断函数便于日后恢复）。
+// 注意区分：忽略（ignore）与等待（wait）是两种不同策略——忽略是丢弃本条 listen start，
+// 等待是推迟本次 listen start 的启动。
 func shouldWaitRealtimeListenStartDuringWelcome(mode string, welcomePlaying bool) bool {
 	return false
 }
 
+// shouldInterruptOutputOnListenStart 判断 listen start 是否需要打断当前输出。
+// 唯一的例外是 realtime + 欢迎语播放中：此时不应打断欢迎语（realtime 是长驻监听，
+// 设备可能在上电时同时发生欢迎语播报与 listen start，打断会让欢迎语残缺）。
+// 其余情况（包括 auto/manual 与 realtime 非欢迎语场景）都返回 true，让「听」优先于「说」。
 func shouldInterruptOutputOnListenStart(mode string, welcomePlaying bool) bool {
 	if mode == "realtime" && welcomePlaying {
 		return false
@@ -558,6 +748,11 @@ func shouldInterruptOutputOnListenStart(mode string, welcomePlaying bool) bool {
 	return true
 }
 
+// completeWelcomePlaybackWaitCh 把结果写入等待通道并关闭它。
+// 「先非阻塞发送、再 close」是刻意的组合：
+//   - 通道带 1 个缓冲，正常路径下接收方能拿到 natural 值；
+//   - close 则保证「即使没人接收」等待方也能立刻解除阻塞，不会永久挂住；
+//   - 用 select+default 而非阻塞发送，是为了在缓冲已满时也不卡住调用方。
 func completeWelcomePlaybackWaitCh(ch chan welcomePlaybackResult, natural bool) {
 	if ch == nil {
 		return
@@ -569,6 +764,9 @@ func completeWelcomePlaybackWaitCh(ch chan welcomePlaybackResult, natural bool) 
 	close(ch)
 }
 
+// beginWelcomePlaybackWait 开启一次「欢迎语播放等待」：新建等待通道，
+// 并把上一轮的旧通道以 natural=false（被打断）收尾。
+// 为什么要收尾旧通道：旧等待者还阻塞在它上面，若不管它就会永久挂住。
 func (s *ChatSession) beginWelcomePlaybackWait() {
 	if s == nil {
 		return
@@ -584,6 +782,8 @@ func (s *ChatSession) beginWelcomePlaybackWait() {
 	}
 }
 
+// completeWelcomePlaybackWait 结束当前等待：摘出通道（置 nil，表示不再有等待）
+// 并以给定结局唤醒等待方。natural=true 表示欢迎语自然播完，false 表示被打断/取消。
 func (s *ChatSession) completeWelcomePlaybackWait(natural bool) {
 	if s == nil {
 		return
@@ -597,6 +797,8 @@ func (s *ChatSession) completeWelcomePlaybackWait(natural bool) {
 	completeWelcomePlaybackWaitCh(ch, natural)
 }
 
+// currentWelcomePlaybackWaitCh 返回当前等待通道（可能为 nil，表示没有正在等待的欢迎语）。
+// 读取时加锁，因为等待通道可能被其他 goroutine 并发替换。
 func (s *ChatSession) currentWelcomePlaybackWaitCh() <-chan welcomePlaybackResult {
 	if s == nil {
 		return nil
@@ -608,6 +810,14 @@ func (s *ChatSession) currentWelcomePlaybackWaitCh() <-chan welcomePlaybackResul
 	return ch
 }
 
+// waitForWelcomePlaybackCompletion 阻塞等待欢迎语播放结束，返回「是否可以继续」。
+//
+// 三种返回 false 的情形都应理解为「本次等待被取消」而不是错误：
+//   - 等待通道被关闭（说明有人重新开始了等待/取消了它）；
+//   - 欢迎语被打断（natural=false，用户已经开口，继续 listen 更合适）；
+//   - 会话/客户端上下文被取消（链路在收尾，没必要继续等）。
+//
+// 返回 true 表示欢迎语完整播完，调用方可安全地进入 realtime listen。
 func (s *ChatSession) waitForWelcomePlaybackCompletion() bool {
 	if s == nil {
 		return true
@@ -646,6 +856,15 @@ func (s *ChatSession) waitForWelcomePlaybackCompletion() bool {
 	}
 }
 
+// resolveDetectAction 是 listen detect 的核心决策函数，把「一段前导文本」映射成一个动作。
+//
+// 决策表（为什么这样分）：
+//   - 空文本 → silent：没内容可做，直接忽略；
+//   - 允许欢迎语 && 是唤醒词：
+//     · 还没说过欢迎语 → welcome（首次唤醒，打个招呼）；
+//     · 已在 auto 监听中 → silent（重复唤醒，别打断正在进行的拾音）；
+//     · 其他（例如欢迎语已说过但当前不在监听）→ llm（可能用户确实在跟助手说话）；
+//   - 非唤醒词 → llm（普通内容，交给模型）。
 func resolveDetectAction(text string, enableGreeting bool, welcomeAlreadySpoken bool, autoListenActive bool) detectAction {
 	if text == "" {
 		return detectActionSilent
@@ -662,6 +881,9 @@ func resolveDetectAction(text string, enableGreeting bool, welcomeAlreadySpoken 
 	return detectActionLLM
 }
 
+// cancelPendingDetectLLM 取消尚未触发的 detect→LLM 去抖任务。
+// 新 detect 到来、收到正式 listen start、会话关闭等场景都要调用它，
+// 否则旧的前导文本会在稍后被重复送进 LLM 队列（用户会听到重复回答）。
 func (s *ChatSession) cancelPendingDetectLLM() {
 	if s == nil {
 		return
@@ -677,6 +899,13 @@ func (s *ChatSession) cancelPendingDetectLLM() {
 	}
 }
 
+// scheduleDetectLLM 把 detect 文本延迟 detectLLMDebounceDuration 后送入 LLM 队列。
+//
+// 去抖（debounce）的目的：给紧随其后的正式 listen start 一个「抢跑」的机会。
+// 若期间收到了 listen start，正式监听会接管这段语音，本次定时任务要么被取消（新的 detect
+// 会 cancel 掉旧的），要么到时发现监听相位已非 idle 而主动跳过。
+// 定时器回调里的三重校验（定时器仍是当前那个、会话未关闭、相位仍为 idle）都是为了
+// 保证「只有一切都没变时才真正入队」。
 func (s *ChatSession) scheduleDetectLLM(text string) {
 	if s == nil {
 		return
@@ -721,6 +950,12 @@ func (s *ChatSession) scheduleDetectLLM(text string) {
 	s.detectLLMDebounceMu.Unlock()
 }
 
+// HandleListenDetect 处理设备的 listen detect 消息（检测到一段可能可用的前导文本）。
+//
+// 注意它「不是」正式拾音的开始，而是一个探路信号，因此这里只做三件事：
+// 检查激活 → 用 resolveDetectAction 决策 → 按动作播欢迎语 / 忽略 / 延迟走 LLM。
+// 内部已有详细的行内说明，这里补充整体意图：把「可能即将开始的对话」尽快处理掉，
+// 同时用 debounce 与「先取消旧的 detect 任务」来避免与正式 listen start 打架。
 func (s *ChatSession) HandleListenDetect(msg *ClientMessage) error {
 	// 新的 detect 到来时，先取消上一条尚未触发的 detect->LLM debounce，
 	// 避免旧前导文本在稍后被重复送入 LLM 队列。
@@ -787,6 +1022,11 @@ func (s *ChatSession) HandleListenDetect(msg *ClientMessage) error {
 	return nil
 }
 
+// HandleNotActivated 对未激活设备播报「请先激活」的提示，并给出激活码。
+//
+// 为什么绕开 LLM 直接走 TTS：设备未激活时不该消耗模型资源，也不需要理解能力，
+// 播一句话即可。这里手动 EnqueueTtsStart/Stop 包住 TTS 调用，是为了让设备侧
+// 正确进入/退出播报状态（否则端上 UI 会一直显示在播）。
 func (s *ChatSession) HandleNotActivated() {
 	configProvider, err := user_config.GetProvider(viper.GetString("config_provider.type"))
 	if err != nil {
@@ -814,6 +1054,17 @@ func (s *ChatSession) HandleNotActivated() {
 
 }
 
+// HandleWelcome 播放欢迎语（设备首次唤醒时）。
+//
+// 几个设计点：
+//   - 全程持有 stopSpeakingMu（直到函数返回）：欢迎语是一次「抢占式输出」，
+//     必须与打断流程串行，否则可能出现「欢迎语刚开始播就被另一条路径清队列」；
+//     注意 goroutine 里的实际播放是在锁释放之后进行的，锁只覆盖状态设置与启动；
+//   - IsWelcomeSpeaking / IsWelcomePlaying 两个标记分别表示「说过欢迎语」与「正在播」，
+//     后者被 listen start 用来判断要不要忽略/打断；
+//   - 使用 AfterAsr 上下文（而非会话上下文）：欢迎语属于「ASR 之后的输出阶段」，
+//     打断/重置只需取消该阶段即可，不影响监听本身；
+//   - beginWelcomePlaybackWait 建立等待通道，供 realtime 的 listen start 等它播完。
 func (s *ChatSession) HandleWelcome() {
 	greetingText := s.GetRandomGreeting()
 
@@ -849,6 +1100,8 @@ func (s *ChatSession) HandleWelcome() {
 	}(ctx, greetingText)
 }
 
+// checkExitWords 判断文本是否包含退出词，用于「用户说再见就让会话退出」。
+// 用「包含」而不是「相等」是故意的：ASR 结果常带语气词/标点（如「那好吧，再见啊」）。
 func (a *ChatSession) checkExitWords(text string) bool {
 	exitWords := []string{"再见", "退下吧", "退出", "退出对话"}
 	for _, word := range exitWords {
@@ -859,10 +1112,14 @@ func (a *ChatSession) checkExitWords(text string) bool {
 	return false
 }
 
+// normalizeOpenClawKeywordText 归一化关键词文本：转小写、去首尾空白、去标点。
+// 关键词匹配必须归一化，否则「进入OpenClaw模式」与「进入 OpenClaw 模式！」会匹配失败。
 func normalizeOpenClawKeywordText(text string) string {
 	return removePunctuation(strings.ToLower(strings.TrimSpace(text)))
 }
 
+// containsOpenClawKeyword 判断文本是否包含任一关键词（双方都先归一化）。
+// 空关键词被跳过，避免配置里留了空串导致「什么都匹配」。
 func containsOpenClawKeyword(text string, keywords []string) bool {
 	normalizedText := normalizeOpenClawKeywordText(text)
 	if normalizedText == "" {
@@ -880,14 +1137,19 @@ func containsOpenClawKeyword(text string, keywords []string) bool {
 	return false
 }
 
+// isOpenClawEnterKeyword 判断是否为「进入 OpenClaw 模式」的触发词（来自设备配置）。
 func (s *ChatSession) isOpenClawEnterKeyword(text string) bool {
 	return containsOpenClawKeyword(text, s.clientState.DeviceConfig.OpenClaw.EnterKeywords)
 }
 
+// isOpenClawExitKeyword 判断是否为「退出 OpenClaw 模式」的触发词（仅在该模式已进入时才有意义）。
 func (s *ChatSession) isOpenClawExitKeyword(text string) bool {
 	return containsOpenClawKeyword(text, s.clientState.DeviceConfig.OpenClaw.ExitKeywords)
 }
 
+// openClawLogSnippet 截取文本前 maxRunes 个字符用于日志。
+// 为什么要截断并按「符文」而不是字节：日志里只关心触发词上下文，
+// 打全量文本既占空间又可能泄露用户内容；按 rune 截断可避免中文被切成乱码。
 func openClawLogSnippet(text string, maxRunes int) string {
 	if maxRunes <= 0 {
 		return ""
@@ -903,6 +1165,7 @@ func openClawLogSnippet(text string, maxRunes int) string {
 	return string(runes[:maxRunes]) + "..."
 }
 
+// GetRandomGreeting 从配置 greeting_list 里随机取一条欢迎语；未配置则用内置兜底文案。
 func (s *ChatSession) GetRandomGreeting() string {
 	greetingList := viper.GetStringSlice("greeting_list")
 	if len(greetingList) == 0 {
@@ -912,14 +1175,19 @@ func (s *ChatSession) GetRandomGreeting() string {
 	return greetingList[rand.Intn(len(greetingList))]
 }
 
+// AddTextToTTSQueue 把文本直接交给 TTS 播报（跳过 LLM）。用于系统提示类播报。
 func (s *ChatSession) AddTextToTTSQueue(text string) error {
 	return s.llmManager.AddTextToTTSQueue(text)
 }
 
+// AddTextToTTSQueueWithOptions 同 AddTextToTTSQueue，但可携带额外选项
+// （开播回调、TTS 轮次结束策略），供「主动播报」等场景定制收尾行为。
 func (s *ChatSession) AddTextToTTSQueueWithOptions(text string, options llmResponseChannelOptions) error {
 	return s.llmManager.AddTextToTTSQueueWithOptions(text, options)
 }
 
+// IsTTSActive 查询 TTS 是否正在输出音频（由 TTSManager 的原子标记表示）。
+// ChatManager.isConversationActive 用它判断「当前是否处于对话中」。
 func (s *ChatSession) IsTTSActive() bool {
 	if s == nil || s.ttsManager == nil {
 		return false
@@ -927,6 +1195,13 @@ func (s *ChatSession) IsTTSActive() bool {
 	return s.ttsManager.ttsActive.Load()
 }
 
+// getOrCreateOpenClawStream 取（或首次创建）某个 correlation_id 对应的 OpenClaw 回复流通道。
+//
+// 背景：OpenClaw 的回复是「按 correlation_id 分片流式」推送的（见 InjectOpenClawResponse），
+// 每次分片都要落到同一个 TTS 播报序列里。因此这里以 correlation_id 为单位维护通道 +
+// 对应的 LLM 响应处理协程（HandleLLMResponseChannelAsyncWithOptions）。
+// 返回的 created 表示本次是否新建：只有新建时才需要做「暖场接管」相关的收尾绑定，
+// 重复分片直接往已有通道里写即可。
 func (s *ChatSession) getOrCreateOpenClawStream(correlationID string) (chan llm_common.LLMResponseStruct, bool, error) {
 	correlationID = strings.TrimSpace(correlationID)
 	if correlationID == "" {
@@ -976,6 +1251,7 @@ func (s *ChatSession) getOrCreateOpenClawStream(correlationID string) (chan llm_
 	return streamChan, true, nil
 }
 
+// closeOpenClawStream 结束并移除某个 correlation_id 的回复流（正常收尾时调用）。
 func (s *ChatSession) closeOpenClawStream(correlationID string) {
 	correlationID = strings.TrimSpace(correlationID)
 	if correlationID == "" {
@@ -986,12 +1262,17 @@ func (s *ChatSession) closeOpenClawStream(correlationID string) {
 	s.openClawStreamMu.Unlock()
 }
 
+// clearOpenClawStreams 丢弃所有 OpenClaw 回复流（打断/退出模式/会话清理时调用）。
+// 直接整体替换 map 而不是逐个删除：这些流已经作废，不需要保留任何引用。
 func (s *ChatSession) clearOpenClawStreams() {
 	s.openClawStreamMu.Lock()
 	s.openClawStreams = make(map[string]chan llm_common.LLMResponseStruct)
 	s.openClawStreamMu.Unlock()
 }
 
+// clearPendingSpeakerResult 清空暂存的声纹结果与就绪信号。
+// 会话重置/退出时调用，避免把上一轮的说话人身份带到新一轮（会导致音色或权限误判）。
+// 就绪通道用循环 select+default 排空，是因为它是缓冲为 1 的信号量语义，排空即「归零」。
 func (s *ChatSession) clearPendingSpeakerResult() {
 	if s == nil {
 		return
@@ -1010,6 +1291,16 @@ func (s *ChatSession) clearPendingSpeakerResult() {
 	}
 }
 
+// InjectOpenClawResponse 处理来自 OpenClaw 的一条回复分片（可能带 correlation_id 的流式分片）。
+//
+// 三种输入形态的差异（都体现在代码分支里）：
+//   - 没有 correlation_id：当作一次性单句注入（非流式兜底）；
+//   - 空文本且不是结束分片：无意义的中间分片，直接跳过；
+//   - 其他：写入对应 correlation_id 的流通道。
+//
+// 与暖场的配合是关键：如果这条流当初挂了暖场话术（openClawWarmup），
+// 那么「第一段真正可播的正文」到达时停掉暖场并把 TTS 交给正式回复——
+// 停得太早会被过短的前导分片抢占，停得太晚则暖场和正文会重叠播报。
 func (s *ChatSession) InjectOpenClawResponse(event openclaw.ResponseDelivery) error {
 	correlationID := strings.TrimSpace(event.CorrelationID)
 	text := strings.TrimSpace(event.Text)
@@ -1077,6 +1368,11 @@ func (s *ChatSession) InterruptAndClearTTSQueue() {
 	s.InterruptAndClearTTSQueueWithReason("ChatSession.InterruptAndClearTTSQueue")
 }
 
+// InterruptAndClearTTSQueueWithReason 打断当前 TTS 并清空待发送队列（带原因以便排查）。
+//
+// 与 StopSpeaking 的区别：这里不取消会话上下文、不清 LLM 队列，只是「让音箱立刻安静」，
+// 因此适合 realtime 模式下「用户开口就先别说了」这种轻量打断。
+// 先挂起媒体播放再清 TTS 队列，是为了避免媒体通道与 TTS 通道互相穿插。
 func (s *ChatSession) InterruptAndClearTTSQueueWithReason(reason string) {
 	log.Infof("interrupt and clear tts queue requested: device=%s reason=%s state={%s}", s.clientState.DeviceID, normalizeTTSReason(reason), s.ttsManager.debugState())
 	if s.mediaPlayer != nil {
@@ -1089,6 +1385,13 @@ func (s *ChatSession) InterruptAndClearTTSQueueWithReason(reason string) {
 }
 
 // handleAbortMessage 处理中止消息
+// 即设备发来的 abort（用户主动打断）。
+//
+// 先取消 detect 去抖任务：abort 意味着本轮不该再有任何延迟产生的输出。
+// 然后按模式选择打断强度：
+//   - realtime：只停 assistant 输出（不挂起媒体），这样正在播的音乐能继续；
+//   - auto/manual：走完整的 StopSpeaking（取消会话上下文、清三条队列），
+//     因为这两种模式下打断通常代表「这一轮不要了」。
 func (s *ChatSession) HandleAbortMessage(msg *ClientMessage) error {
 	s.cancelPendingDetectLLM()
 
@@ -1106,6 +1409,12 @@ func (s *ChatSession) HandleAbortMessage(msg *ClientMessage) error {
 	return nil
 }
 
+// CheckDeviceActivated 校验设备是否已激活；未激活时顺带触发激活提示播报。
+//
+// 「短时间节流」是这里的关键设计：未激活设备会高频重发 listen，
+// 每次都去查一次激活接口会造成无谓压力（而且结果短时间内不会变），
+// 因此在确认未激活后 1 秒内直接复用该结论，跳过实时校验。
+// 设备一旦激活成功，会清除节流时间戳并更新 IsActivated，后续不再走这条路径。
 func (s *ChatSession) CheckDeviceActivated() (bool, error) {
 	if viper.GetBool("auth.enable") {
 		if !s.clientState.IsActivated {
@@ -1146,6 +1455,24 @@ func (s *ChatSession) CheckDeviceActivated() (bool, error) {
 	return true, nil
 }
 
+// [0.5] 开始拾音：listen start 到达，准备进入「上行音频 → ASR」阶段。
+//
+// HandleListenStart 处理 listen start：开启一轮新的拾音。
+//
+// 整体思路与顺序：
+//  1. 先做激活校验（未激活设备不该进入拾音链路）；
+//  2. auto/manual 下若欢迎语正在播，直接忽略本条包（不抢占欢迎语）；
+//  3. 按 mode 分流（这是本函数最重要的分野）：
+//     · realtime：长驻监听语义。若已有 realtime 监听会话在进行，重复包静默忽略；
+//     否则停止当前输出后异步启动监听。
+//     · auto/manual：开启一轮新的正式拾音。若上一次启动还在进行中则忽略重复包；
+//     否则停止旧输出、启动新监听。
+//
+// 两个分支最后都通过 beginListenStart() 取得代际号，然后把实际启动放到 goroutine 里，
+// 由 OnListenStart 沿途校验代际，保证「启动期间来的新指令」能生效（旧启动会自行作废）。
+//
+// realtime 与 auto/manual 的本质差异：前者要「尽量不停」，后者是「每轮重新开始」，
+// 所以 realtime 跳过 Destroy（保持 ASR 运行），auto/manual 会重建 ASR 与相关状态。
 func (s *ChatSession) HandleListenStart(msg *ClientMessage) error {
 	s.cancelPendingDetectLLM()
 
@@ -1240,6 +1567,12 @@ func (s *ChatSession) HandleListenStart(msg *ClientMessage) error {
 	return nil
 }
 
+// HandleListenStop 处理 listen stop：设备表示本轮拾音结束。
+//
+// 两种模式的处理差异：realtime 需要显式作废监听代际（长驻会话结束，还要清理
+// realtimeListenSessionActive 标记，否则下次 listen start 会被当成重复包忽略）；
+// auto/manual 不在这里取消会话上下文（注释掉的分支说明曾有此意图），
+// 而是交给 OnManualStop 走「收口 ASR 拿结果」的正常路径。
 func (s *ChatSession) HandleListenStop() error {
 	s.cancelPendingDetectLLM()
 	s.clientState.RecordCommandArrival(CommandTypeListenStop, time.Now())
@@ -1256,6 +1589,22 @@ func (s *ChatSession) HandleListenStop() error {
 	return nil
 }
 
+// OnListenStart 真正执行一轮 listen start 的启动：准备上下文/状态，重启 ASR，并跑识别结果循环。
+//
+// 为什么要带 startSeq（代际号）：本函数在 goroutine 中执行，执行期间可能又来了新的
+// listen start、listen stop 或打断。因此每个「可能耗时」的步骤前后都要用
+// isCurrentListenStart 校验一次：一旦代际变了就立刻放弃，避免把过期的启动结果写进新状态。
+//
+// realtime 与 auto/manual 在「上下文/状态准备」上的差异（本函数的第一个大分支）：
+//   - realtime：不 Destroy（保持 ASR/VAD 资源常驻），只清空音频缓冲；
+//   - auto/manual：Destroy 重置所有会话级状态（ASR 缓冲、VAD、上下文、统计），
+//     因为每轮拾音都是全新的，旧状态必须清干净才不会污染识别。
+//     这一步还要持 stopSpeakingMu，与打断流程互斥。
+//
+// 启动成功的判定顺序也有讲究：先 RestartAsrRecognition（拿到 ASR 结果通道），
+// 再把相位置为 listening、启动空闲窗口，然后才进入识别结果循环。
+// onMessageSave / onError 两个回调分别负责「把用户语音+文本存历史」与「识别循环出错处理」，
+// 都带着代际号，因此过期回调会自我作废而不是打扰新的一轮。
 func (s *ChatSession) OnListenStart(startSeq uint64, shouldStartAudioIdleWindow bool) error {
 	log.Debugf("OnListenStart start")
 	defer log.Debugf("OnListenStart end")
@@ -1315,7 +1664,7 @@ func (s *ChatSession) OnListenStart(startSeq uint64, shouldStartAudioIdleWindow 
 		}
 	}
 
-	// 启动asr流式识别，复用 restartAsrRecognition 函数
+	// [1.2] 建 ASR 流：启动asr流式识别（取池化 provider + 建 AsrAudioChannel + StreamingRecognize）
 	if !s.isCurrentListenStart(startSeq) {
 		log.Debugf("OnListenStart stale before ASR restart, skip")
 		return nil
@@ -1350,6 +1699,11 @@ func (s *ChatSession) OnListenStart(startSeq uint64, shouldStartAudioIdleWindow 
 	}
 
 	// 定义消息保存回调
+	// 把「用户这轮的文本 + 对应音频」通过事件总线发布出去，由订阅方落库。
+	// 用 eventbus 而不是直接写库的原因：写入属于另一个领域（消息持久化），
+	// 会话不应该依赖具体存储；同时这一动作不能阻塞识别循环，交给事件总线异步处理。
+	// 注意这里是「一次性保存」（文本与音频同时就绪），所以 IsUpdate=false，
+	// 区别于 assistant 消息的两阶段保存（先生成文本、播完再补音频）。
 	onMessageSave := func(userMsg *schema.Message, messageID string, audioData []float32) {
 		// ASR 文本和音频同时获取，一次性保存（不需要两阶段）
 		eventbus.Get().Publish(eventbus.TopicAddMessage, &eventbus.AddMessageEvent{
@@ -1366,6 +1720,10 @@ func (s *ChatSession) OnListenStart(startSeq uint64, shouldStartAudioIdleWindow 
 	}
 
 	// 定义错误处理回调
+	// 识别循环结束时的收尾。
+	// 先判断是否只是「本轮被重置/退出」（shouldIgnoreAsrLoopError），是则安静结束；
+	// 否则视为致命错误，关闭会话（带 fatal_error 原因，MQTT 下会据此给设备发 goodbye）。
+	// 必须用代际判断，否则旧循环的退出错误会误伤新的一轮。
 	onError := func(err error) {
 		if s.shouldIgnoreAsrLoopError(startSeq, ctx, err) {
 			log.Infof("ASR识别循环在重置/退出中结束，忽略 err: %v", err)
@@ -1375,17 +1733,31 @@ func (s *ChatSession) OnListenStart(startSeq uint64, shouldStartAudioIdleWindow 
 		s.CloseWithReason(chatSessionCloseReasonFatalError)
 	}
 
-	// 启动ASR识别结果处理循环（资源管理在 ASRManager 内部）
+	// [2.0] 读识别结果：启动ASR识别结果处理循环（资源管理在 ASRManager 内部）
 	s.asrManager.StartAsrRecognitionLoop(ctx, onMessageSave, onError)
 
 	return nil
 }
 
 // startChat 开始对话
+// [2.3] 入队交接（简化版）：委托给 AddAsrResultToQueueWithOptions。
+//
+// AddAsrResultToQueue 把 ASR 识别结果送进文本队列，交给 LLM 处理（无额外选项的简化版）。
 func (s *ChatSession) AddAsrResultToQueue(text string, speakerResult *speaker.IdentifyResult) error {
 	return s.AddAsrResultToQueueWithOptions(text, speakerResult, llmResponseChannelOptions{})
 }
 
+// [2.3] 入队交接：把 ASR 文本（含声纹结果）推进 chatTextQueue，交给 LLM 阶段。
+//
+// AddAsrResultToQueueWithOptions 把 ASR 结果（含声纹结果）入队等待 LLM 处理。
+//
+// 两处关键设计：
+//   - TryLock 探测 StopSpeaking：如果打断（stopSpeakingWithLock）正持有 stopSpeakingMu，
+//     说明「这一轮正在被清空/取消」，这条文本注定会与清空动作打架，于是直接丢弃。
+//     用 TryLock 而不是 Lock 是为了不阻塞识别链路——如果选择等待，等锁释放后队列已被清空，
+//     消息仍然是无效的，只是白白卡住 ASR 循环。
+//   - ctx 随元素入队（AsrResponseChannelItem.ctx）：处理时用当时的上下文，
+//     若中途被打断（ctx 被取消）就能自动丢弃，避免「用旧上下文回答新问题」。
 func (s *ChatSession) AddAsrResultToQueueWithOptions(text string, speakerResult *speaker.IdentifyResult, options llmResponseChannelOptions) error {
 	log.Debugf("AddAsrResultToQueue text: %s", text)
 	if speakerResult != nil && speakerResult.Identified {
@@ -1415,6 +1787,7 @@ func (s *ChatSession) AddAsrResultToQueueWithOptions(text string, speakerResult 
 		text:          text,
 		speakerResult: speakerResult,
 	}
+	// [2.3] 入队：ASR 文本进入 chatTextQueue，等待 processChatText 消费
 	err := s.chatTextQueue.Push(item)
 	if err != nil {
 		log.Warnf("chatTextQueue 已满或已关闭, 丢弃消息")
@@ -1422,11 +1795,19 @@ func (s *ChatSession) AddAsrResultToQueueWithOptions(text string, speakerResult 
 	return nil
 }
 
+// [3.0] 取队列：常驻消费 chatTextQueue，逐条取出 ASR 文本。
+//
+// processChatText 是 chatTextQueue 的常驻消费循环，把 ASR 文本逐条交给 actionDoChat 路由。
+//
+// Pop(ctx, 0) 的 0 表示「不设等待超时」，即阻塞等待直到有元素或 ctx 结束：
+// 这样消费循环空闲时完全不消耗 CPU。只有 ctx 结束（ErrQueueCtxDone）才退出，
+// 其他错误仅记日志后继续，避免一次异常就终结整条文本链路。
 func (s *ChatSession) processChatText(ctx context.Context) {
 	log.Debugf("processChatText start")
 	defer log.Debugf("processChatText end")
 
 	for {
+		// [3.0] 取队列：阻塞等待下一条 ASR 文本（0 = 不设超时，空闲不耗 CPU）
 		item, err := s.chatTextQueue.Pop(ctx, 0)
 		if err != nil {
 			if err == util.ErrQueueCtxDone {
@@ -1443,11 +1824,19 @@ func (s *ChatSession) processChatText(ctx context.Context) {
 	}
 }
 
+// ClearChatTextQueue 清空待处理的 ASR 文本（打断/重置时用）。
+// 与 StopSpeaking 配合：队列里的文本代表「还没回答的问题」，打断时它们已失去意义。
 func (s *ChatSession) ClearChatTextQueue() {
 	s.chatTextQueue.Clear()
 }
 
 // DoExitChat 执行退出聊天逻辑（发送再见语并关闭会话）
+// 即：播一句再见语，然后关闭会话。
+//
+// 顺序说明：先把再见语存进历史（免得历史里缺一条），再同步等 TTS 播完
+// （handleTextResponse 最后一个参数为 true = 同步），最后才 CloseWithReason(explicit_exit)。
+// 必须先播完再关：CloseWithReason 会取消上下文并清空 TTS 队列，
+// 若先关闭，这句再见语根本发不出去。关闭原因用 explicit_exit，MQTT 下会据此给设备发 goodbye。
 func (s *ChatSession) DoExitChat() {
 	// 友好的再见语
 	goodbyeText := "好的，再见！期待下次与您聊天～"
@@ -1481,10 +1870,13 @@ func (s *ChatSession) DoExitChat() {
 	s.CloseWithReason(chatSessionCloseReasonExplicitExit)
 }
 
+// Close 以 manager_shutdown 为原因关闭会话（ChatManager 整体关闭时使用的简写）。
 func (s *ChatSession) Close() {
 	s.CloseWithReason(chatSessionCloseReasonManagerShutdown)
 }
 
+// IsClosing 判断会话是否正在关闭。nil 接收者也返回 true（视为已关闭），
+// 这样调用方拿到 nil 会话时不必额外判空就能安全地「当它已关闭」处理。
 func (s *ChatSession) IsClosing() bool {
 	if s == nil {
 		return true
@@ -1492,6 +1884,20 @@ func (s *ChatSession) IsClosing() bool {
 	return s.closing.Load()
 }
 
+// CloseWithReason 关闭会话并释放全部资源；用 closeOnce 保证真正的清理只执行一次
+// （打断、超时、连接关闭等多条路径都可能触发关闭）。
+//
+// 清理顺序刻意安排成这样：
+//  1. 先关 ASR（停识别、归还资源池）；
+//  2. 再从媒体运行时上「解绑但保留状态」（DetachSession(true)），
+//     这样设备重连后还能恢复正在播放的内容；
+//  3. 取消 detect 去抖与 session 上下文，让所有后台 goroutine 停下；
+//  4. 清空文本队列与 OpenClaw 流；
+//  5. stopSpeaking（注意 suspendMedia=false：前面已 Detach，不能再挂起，否则会清掉
+//     媒体「重连后自动继续」的标记）；
+//  6. 关声纹管理器；
+//  7. 发布 TopicSessionEnd 事件（让订阅方做会话级收尾，例如统计/落库）；
+//  8. 最后回调 closeHandler，通知 ChatManager 做连接层决策（是否发 goodbye 等）。
 func (s *ChatSession) CloseWithReason(reason string) {
 	s.closing.Store(true)
 	s.closeOnce.Do(func() {
@@ -1530,6 +1936,8 @@ func (s *ChatSession) CloseWithReason(reason string) {
 		}
 
 		if s.clientState != nil {
+			// 通过事件总线广播「会话结束」，让消息持久化/统计等订阅方收尾。
+			// 放最后但仍早于 closeHandler：上层回调可能立即复用/重建会话。
 			eventbus.Get().Publish(eventbus.TopicSessionEnd, s.clientState)
 		}
 
@@ -1541,6 +1949,24 @@ func (s *ChatSession) CloseWithReason(reason string) {
 	})
 }
 
+// [3.1] 路由：决定这段文本走本地播放指令、OpenClaw、退出词，还是进 LLM。
+//
+// actionDoChat 是「一段用户文本该做什么」的路由表，按优先级依次判断。
+//
+// 为什么顺序如此（前面的分支会直接 return，越靠前优先级越高）：
+//  1. deadline/取消检查：已过期的文本不再处理；
+//  2. tryHandleRealtimeMcpAudioASR：realtime 正在播 MCP 音频时，先把文本当作
+//     「暂停/继续/下一首/退出」等本地播放指令识别，命中就直接控制播放器，不走 LLM。
+//     放在最前是因为音乐控制要求零延迟，且此时把话交给 LLM 反而会打断播放；
+//  3. OpenClaw 模式：进入/退出关键词与已进入模式下的消息转发（这是一种「旁路」模式，
+//     接管后不该再走普通对话）；
+//  4. 退出词 → 发布 TopicExitChat 事件，交给上层（ChatManager）关闭会话，
+//     注意这里是「发事件」而不是直接关会话，避免会话层反向依赖连接层；
+//  5. switchTTSForSpeaker：按声纹结果切换音色（不同家庭成员用不同声音）；
+//  6. 组装可用工具（设备 MCP 工具 + 知识库裁剪）后调用 llmManager.DoLLmRequest。
+//
+// 关于 realtime 媒体门控的位置：必须在 OpenClaw 与退出词之前，因为它代表「设备此刻
+// 在放音频，用户说的很可能是播放指令」，这是比模式判断与退出判断更即时的事实。
 func (s *ChatSession) actionDoChat(ctx context.Context, text string, speakerResult *speaker.IdentifyResult) error {
 	select {
 	case <-ctx.Done():
@@ -1675,7 +2101,7 @@ func (s *ChatSession) actionDoChat(ctx context.Context, text string, speakerResu
 		Content: text,
 	}
 
-	// 获取全局MCP工具列表
+	// [3.2] 组装工具：获取全局MCP工具列表（设备 MCP 工具 + 知识库裁剪）
 	mcpTools, err := mcp.GetToolsByDeviceIdWithTransport(
 		clientState.DeviceID,
 		clientState.AgentID,
@@ -1711,7 +2137,7 @@ func (s *ChatSession) actionDoChat(ctx context.Context, text string, speakerResu
 		toolNameList = append(toolNameList, tool.Name)
 	}
 
-	// 发送带工具的LLM请求
+	// [3.3] 请求 LLM：发送带工具的LLM请求（内部会组装消息并起响应消费协程）
 	log.Infof("使用 %d 个MCP工具发送LLM请求, tools: %+v", len(einoTools), toolNameList)
 
 	err = s.llmManager.DoLLmRequest(ctx, userMessage, einoTools, true, speakerResult)
@@ -1722,6 +2148,9 @@ func (s *ChatSession) actionDoChat(ctx context.Context, text string, speakerResu
 	return nil
 }
 
+// hasAvailableKnowledgeBase 判断设备是否关联了「可用」的知识库。
+// 没有可用知识库时会从工具列表里移除 search_knowledge，理由很实际：
+// 让模型看见一个必然查不到东西的工具，只会诱导它做无用调用并编造答案。
 func hasAvailableKnowledgeBase(knowledgeBases []types.KnowledgeBaseRef) bool {
 	for _, kb := range knowledgeBases {
 		if strings.EqualFold(strings.TrimSpace(kb.Status), "inactive") {
@@ -1735,6 +2164,9 @@ func hasAvailableKnowledgeBase(knowledgeBases []types.KnowledgeBaseRef) bool {
 	return false
 }
 
+// MarkTurnSpeakerInterrupted 标记「本轮因声纹相关原因被打断」。
+// 被打断本身就隐含了一个事实：说话人可能不是已登记的人（否则不会打断），
+// 因此该标记会影响 ShouldAllowSpeakerChat 的判定。
 func (s *ChatSession) MarkTurnSpeakerInterrupted() {
 	if s == nil {
 		return
@@ -1742,6 +2174,7 @@ func (s *ChatSession) MarkTurnSpeakerInterrupted() {
 	s.turnSpeakerInterrupted.Store(true)
 }
 
+// ConsumeTurnSpeakerInterrupted 读取并清除该标记（读后即清，保证只影响当前这一轮）。
 func (s *ChatSession) ConsumeTurnSpeakerInterrupted() bool {
 	if s == nil {
 		return false
@@ -1749,6 +2182,7 @@ func (s *ChatSession) ConsumeTurnSpeakerInterrupted() bool {
 	return s.turnSpeakerInterrupted.Swap(false)
 }
 
+// ResetTurnSpeakerInterrupted 清除该标记（新一轮开始时调用）。
 func (s *ChatSession) ResetTurnSpeakerInterrupted() {
 	if s == nil {
 		return
@@ -1756,6 +2190,14 @@ func (s *ChatSession) ResetTurnSpeakerInterrupted() {
 	s.turnSpeakerInterrupted.Store(false)
 }
 
+// ShouldAllowSpeakerChat 判断当前说话人是否被允许参与对话，并给出拒绝原因。
+//
+// 两条规则（对应两种配置意图）：
+//   - 本轮因声纹被打断、且说话人不是已登记的人 → 拒绝（speaker_interrupt_without_identify）：
+//     被打断说明这是个「不请自来」的声音，不该响应；
+//   - 设备配置为「仅已登记说话人可对话」（identified_only）→ 未匹配则拒绝。
+//
+// 返回的第二个值只用于日志/排查，不参与控制流。
 func (s *ChatSession) ShouldAllowSpeakerChat(speakerResult *speaker.IdentifyResult, speakerInterrupted bool) (bool, string) {
 	if s == nil || s.clientState == nil {
 		return true, ""
@@ -1774,6 +2216,15 @@ func (s *ChatSession) ShouldAllowSpeakerChat(speakerResult *speaker.IdentifyResu
 }
 
 // switchTTSForSpeaker 为识别的说话人切换TTS
+//
+// 整体思路：先把 SpeakerTTSConfig 置 nil（回到默认音色），只有「识别成功 + 该说话人
+// 配置了自定义音色 + 系统里存在对应 tts 配置」三个条件都满足时才设置新音色。
+// 这样任何一步缺失都会自然回退到默认音色，不需要额外的兜底分支。
+//
+// 两个实现细节的原因：
+//   - 配置做深拷贝再存：viper 里的 tts 配置是全局共享的，直接改会污染其他设备/其他说话人；
+//   - 音色字段名按 provider 区分（cosyvoice 用 spk_id，其他用 voice）：
+//     这是各 TTS provider 的参数约定，统一成一个名字会导致其中一方无效。
 func (s *ChatSession) switchTTSForSpeaker(speakerResult *speaker.IdentifyResult) error {
 	s.clientState.SpeakerTTSConfig = nil
 
@@ -1880,6 +2331,8 @@ func (s *ChatSession) switchTTSForSpeaker(speakerResult *speaker.IdentifyResult)
 	return nil
 }
 
+// hookContext 组装钩子调用所需的最小上下文（ctx + 会话 ID + 设备 ID）。
+// 注意它同时做了 nil 保护：钩子可能在任何清理阶段被调用，此时会话可能已残缺。
 func (s *ChatSession) hookContext(ctx context.Context) chathooks.Context {
 	sessionID := ""
 	deviceID := ""
@@ -1895,6 +2348,9 @@ func (s *ChatSession) hookContext(ctx context.Context) chathooks.Context {
 	}
 }
 
+// emitMetricStage 把一次耗时指标阶段上报给钩子中心。
+// 所有 Trace* 方法都汇聚到这里，好处是「指标是否上报、失败如何处理」只有一处逻辑：
+// 钩子执行失败只记 warn，绝不影响主流程（指标是旁路能力，不该拖垮对话）。
 func (s *ChatSession) emitMetricStage(ctx context.Context, stage chathooks.MetricStage, ts int64, err error) {
 	if s == nil {
 		return
@@ -1906,50 +2362,63 @@ func (s *ChatSession) emitMetricStage(ctx context.Context, stage chathooks.Metri
 	}
 }
 
+// TraceTurnStart 标记「本轮对话开始」，作为整轮耗时的起点。
 func (s *ChatSession) TraceTurnStart(ctx context.Context, ts int64) {
 	s.emitMetricStage(ctx, chathooks.MetricTurnStart, ts, nil)
 }
 
+// TraceTurnEnd 标记「本轮对话结束」，并携带本轮是否出错（用于统计成功率与端到端耗时）。
 func (s *ChatSession) TraceTurnEnd(ctx context.Context, ts int64, err error) {
 	s.emitMetricStage(ctx, chathooks.MetricTurnEnd, ts, err)
 }
 
+// TraceVoiceSilence 标记 VAD 判定「用户说完话了」的时刻，是「说话结束→首字」延迟的分母起点。
 func (s *ChatSession) TraceVoiceSilence(ctx context.Context, ts int64) {
 	s.emitMetricStage(ctx, chathooks.MetricVoiceSilence, ts, nil)
 }
 
+// TraceAsrFirstText 标记 ASR 首次返回文本的时刻，用于衡量 ASR 首字延迟。
 func (s *ChatSession) TraceAsrFirstText(ctx context.Context, ts int64) {
 	s.emitMetricStage(ctx, chathooks.MetricAsrFirstText, ts, nil)
 }
 
+// TraceAsrFinalText 标记 ASR 给出最终文本的时刻，用于衡量 ASR 收口（尾延迟）。
 func (s *ChatSession) TraceAsrFinalText(ctx context.Context, ts int64) {
 	s.emitMetricStage(ctx, chathooks.MetricAsrFinalText, ts, nil)
 }
 
+// TraceLlmStart 标记 LLM 请求发出的时刻。
 func (s *ChatSession) TraceLlmStart(ctx context.Context, ts int64) {
 	s.emitMetricStage(ctx, chathooks.MetricLlmStart, ts, nil)
 }
 
+// TraceLlmFirstToken 标记 LLM 首个 token 到达的时刻（首 token 延迟是体感快慢的关键指标）。
 func (s *ChatSession) TraceLlmFirstToken(ctx context.Context, ts int64) {
 	s.emitMetricStage(ctx, chathooks.MetricLlmFirstToken, ts, nil)
 }
 
+// TraceLlmFirstSentence 标记 LLM 产出第一个完整句子的时刻。
+// 它比首 token 更贴近体感：因为 TTS 需要拿到整句才能开播（分句由 streamtransform 插件完成）。
 func (s *ChatSession) TraceLlmFirstSentence(ctx context.Context, ts int64) {
 	s.emitMetricStage(ctx, chathooks.MetricLlmFirstSentence, ts, nil)
 }
 
+// TraceLlmEnd 标记 LLM 一轮输出结束（携带错误信息，便于统计失败率）。
 func (s *ChatSession) TraceLlmEnd(ctx context.Context, ts int64, err error) {
 	s.emitMetricStage(ctx, chathooks.MetricLlmEnd, ts, err)
 }
 
+// TraceTtsStart 标记 TTS 开始合成/发送的时刻。
 func (s *ChatSession) TraceTtsStart(ctx context.Context, ts int64) {
 	s.emitMetricStage(ctx, chathooks.MetricTtsStart, ts, nil)
 }
 
+// TraceTtsFirstFrame 标记 TTS 首个音频帧就绪的时刻（决定「多久听到声音」，最关键的体感指标）。
 func (s *ChatSession) TraceTtsFirstFrame(ctx context.Context, ts int64) {
 	s.emitMetricStage(ctx, chathooks.MetricTtsFirstFrame, ts, nil)
 }
 
+// TraceTtsStop 标记 TTS 一轮播报停止的时刻（携带错误信息，并作为整轮结束耗时的收口点）。
 func (s *ChatSession) TraceTtsStop(ctx context.Context, ts int64, err error) {
 	s.emitMetricStage(ctx, chathooks.MetricTtsStop, ts, err)
 }
